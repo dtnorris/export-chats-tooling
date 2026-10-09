@@ -143,25 +143,33 @@ recovery.
 
 ## **Daily commands to save/scrape chatgpt context**
 
-1. cd /Users/davidnorris/code/export-chats-tooling && ruby capture_watch.rb
+1. Keep the Mac awake. Run this in a separate terminal and leave it running until the export is complete:
+    - caffeinate -dimsu
 
-2. caffeinate -dimsu
+2. Refresh the project inventory.
+    - (load the Adventure Finder project page in the UI), (paste the copied JS code and run)
+    - `cd /Users/davidnorris/code/export-chats-tooling && pbcopy < project_inventory.js`
 
-3. cd /Users/davidnorris/code/export-chats-tooling && pbcopy < project_inventory.js
-    1. (load the Adventure Finder project page in the UI), (paste the copied JS
-       code and run)
+3. (Move the newly downloaded inventory JSON and CSV files into:)
+    - `/Users/davidnorris/code/export-chats-data`
 
-4. (move the newly downloaded inventory .json and .csv into:
-	1. /Users/davidnorris/code/export-chats-data)
+4. Generate the current pending queue and browser exporter.
+    - (This regenerates `.state/project_batch_console.js` from the refreshed inventory. If it reports Pending IDs: 0, no batch export is needed.)
+    - `cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb`
 
-5. cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb
-	1. This regenerates .state/project_batch_console.js from the new inventory.
+5. Start the capture watcher in a separate terminal.
+    - (Leave it running while exporting. The watcher reads the pending queue only at startup, so start it after reconciliation. Restart an existing watcher before running a batch with a newly generated queue.)
+    - `cd /Users/davidnorris/code/export-chats-tooling && ruby capture_watch.rb`
 
-6. cd /Users/davidnorris/code/export-chats-tooling && pbcopy <
-   .state/project_batch_console.js
-	1. (load the Adventure Finder project page in the UI)
-	2. (paste the copied JS code and run)
+6. Copy and run the generated browser exporter.
+    - (Open the Adventure Finder project page in ChatGPT, paste the copied JavaScript into the browser’s developer console, and run it.)
+    - `cd /Users/davidnorris/code/export-chats-tooling && pbcopy < .state/project_batch_console.js`
 
-7. *After the batch finishes:*
-	1. cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb
-	2. (look to confirm **Pending IDs: 0**)
+7.  Wait for local ingestion to finish.
+    - (After the browser batch finishes, let the watcher finish processing all completed downloads. Check its output for rejected captures or errors, then stop the watcher with Ctrl-C.)
+
+8. Verify the archive.
+    - `cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb`
+	- (look to confirm **Pending IDs: 0**)
+    - If IDs remain, investigate the watcher and browser output before retrying. Start a fresh watcher before running the regenerated exporter.
+    - When finished, stop caffeinate with Ctrl-C in its terminal.
