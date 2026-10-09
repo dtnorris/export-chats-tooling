@@ -11,7 +11,7 @@
     1_800_000
   ];
   const SESSION_REFRESH_SKEW_SECONDS = 300;
-  const logPrefix = "[AdventureFinder Batch Export]";
+  const logPrefix = "[ChatGPT Batch Export]";
 
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -28,7 +28,7 @@
     const parts = new URL(location.href).pathname.split("/").filter(Boolean);
     const id = parts.find(part => part.startsWith("g-p-")) || null;
     if (!id) {
-      fail("Run this from the open AdventureFinder project page; no g-p-... project ID was found in the current URL.");
+      fail("Run this from the open ChatGPT project page for this queue; no g-p-... project ID was found in the current URL.");
     }
     return id;
   }

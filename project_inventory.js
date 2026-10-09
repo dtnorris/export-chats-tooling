@@ -1,9 +1,14 @@
 (async () => {
   "use strict";
 
-  const EXPECTED_COUNT = 462;
+  // Optional audit assertion; omit or clear it for an inventory of any size.
+  const expectedCount = window.__chatProjectInventoryExpectedCount ?? null;
   const PAGE_LIMIT = 10000;
-  const logPrefix = "[AdventureFinder Project Inventory]";
+  const logPrefix = "[ChatGPT Project Inventory]";
+
+  // Do not leave an earlier successful manifest visible after a failed rerun.
+  delete window.__chatProjectInventory;
+  delete window.__adventureFinderProjectInventory;
 
   const sleep = ms =>
     new Promise(resolve => setTimeout(resolve, ms));
@@ -18,6 +23,11 @@
     throw new Error(message);
   }
 
+  if (expectedCount !== null &&
+      (!Number.isSafeInteger(expectedCount) || expectedCount < 0)) {
+    fail("window.__chatProjectInventoryExpectedCount must be a non-negative safe integer, or null/undefined to disable the count check.");
+  }
+
   function getProjectId() {
     const parts = new URL(location.href)
       .pathname
@@ -30,7 +40,7 @@
     if (!projectId) {
       fail(
         "Could not find a g-p-... project ID in the current URL. " +
-        "Run this from the open AdventureFinder project page."
+        "Run this from the open ChatGPT project page you want to inventory."
       );
     }
 
@@ -322,7 +332,7 @@
 
     rawPages.push(page);
 
-    if (!Array.isArray(page.items)) {
+    if (!page || typeof page !== "object" || !Array.isArray(page.items)) {
       fail(
         `Page ${pageNumber} did not contain an items array.`,
         page
@@ -342,7 +352,7 @@
 
       if (
         typeof id !== "string" ||
-        !id
+        !id.trim()
       ) {
         fail(
           `Page ${pageNumber}, item ${index} has no usable conversation ID.`,
@@ -405,7 +415,7 @@
 
     if (
       typeof nextCursor !== "string" ||
-      !nextCursor
+      !nextCursor.trim()
     ) {
       fail(
         "Project page returned an invalid next cursor.",
@@ -423,6 +433,10 @@
     await sleep(1000);
   }
 
+  if (expectedCount !== null && conversations.length !== expectedCount) {
+    fail(`Inventory count mismatch: observed ${conversations.length}, expected ${expectedCount}. No inventory files were downloaded.`);
+  }
+
   const inventory = {
     schema:
       "adventurefinder-chat-project-inventory/v0.1",
@@ -434,14 +448,13 @@
       projectId,
 
     expected_conversation_count:
-      EXPECTED_COUNT,
+      expectedCount,
 
     observed_conversation_count:
       conversations.length,
 
     count_matches_expected:
-      conversations.length ===
-      EXPECTED_COUNT,
+      expectedCount === null ? null : conversations.length === expectedCount,
 
     page_count:
       rawPages.length,
@@ -452,14 +465,15 @@
       rawPages
   };
 
-  window.__adventureFinderProjectInventory =
-    inventory;
+  window.__chatProjectInventory = inventory;
+  // Compatibility alias for existing consumers of the v0.1 manifest.
+  window.__adventureFinderProjectInventory = inventory;
 
   const date =
     localDateYYYYMMDD();
 
   const base =
-    `${date} - AdventureFinder Project Inventory`;
+    `${date} - ChatGPT ${safeFilenamePart(projectId).slice(0, 100)} Project Inventory`;
 
   downloadText(
     JSON.stringify(inventory, null, 2) + "\n",
@@ -518,32 +532,12 @@
 
   console.log(
     logPrefix,
-    "Expected:",
-    EXPECTED_COUNT
-  );
-
-  if (
-    conversations.length !==
-    EXPECTED_COUNT
-  ) {
-    console.error(
-      logPrefix,
-      `VALIDATION FAILED: observed ${conversations.length}, expected ${EXPECTED_COUNT}.`
-    );
-
-    throw new Error(
-      `AdventureFinder inventory count mismatch: ` +
-      `${conversations.length} != ${EXPECTED_COUNT}`
-    );
-  }
-
-  console.log(
-    logPrefix,
-    "VALIDATION PASSED: exactly 462 AdventureFinder conversations."
+    "VALIDATION PASSED: pagination exhausted with unique conversation IDs.",
+    expectedCount === null ? "No expected-count assertion configured." : `Expected count ${expectedCount} matched.`
   );
 
   console.log(
     logPrefix,
-    "Manifest also available as window.__adventureFinderProjectInventory"
+    "Manifest also available as window.__chatProjectInventory"
   );
 })();

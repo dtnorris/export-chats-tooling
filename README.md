@@ -114,9 +114,12 @@ This is **unofficial, personal-use tooling**, not OpenAI's supported
 account-data export service.
 
 It relies on ChatGPT's authenticated web interface and undocumented internal
-endpoints, which may change. The project-wide workflow currently contains
-AdventureFinder-specific assumptions and is not a general account-wide
-exporter.
+endpoints, which may change. Project inventory uses the ID of the open ChatGPT
+Project and supports any conversation count, with an optional exact-count audit.
+Pagination checks validate the returned listing; they cannot prove an atomic
+server snapshot. This is not a general account-wide exporter. Historical
+AdventureFinder schema names remain for compatibility, and checkpoints support
+one project per tooling checkout.
 
 Markdown captures supported visible conversation text; images, audio, and other
 non-text content may appear as placeholders rather than original media. The raw
@@ -135,23 +138,34 @@ See the daily workflow below for routine incremental exports, or
 two-conversation smoke test, browser-console execution, and interruption
 recovery.
 
+Offline inventory regression tests use Node.js 18 or later:
+
+```bash
+node --test test/project_inventory.test.js
+```
+
 ---
 
-<!-- Existing daily workflow instructions follow. -->
 
 
 
-## **Daily commands to save/scrape chatgpt context**
+## Daily export quick reference (macOS)
+
+Run commands from your `export-chats-tooling` checkout. Keep a separate archive
+directory; the default is `../export-chats-data`. See
+[AUTOMATED_EXPORT.md](AUTOMATED_EXPORT.md) for explicit archive/inventory paths
+and instructions for keeping projects separate.
 
 1. Keep the Mac awake. Run this in a separate terminal and leave it running until the export is complete:
-    - caffeinate -dimsu
+    - `caffeinate -dimsu`
 
 2. Refresh the project inventory.
-    - (load the Adventure Finder project page in the UI), (paste the copied JS code and run)
+    - (Open the ChatGPT Project you want to archive, paste the copied JavaScript into its developer console, and run it.)
+    - (No expected count is required. If you previously enabled the optional audit, clear it with `delete window.__chatProjectInventoryExpectedCount` first.)
     - `cd /Users/davidnorris/code/export-chats-tooling && pbcopy < project_inventory.js`
 
 3. (Move the newly downloaded inventory JSON and CSV files into:)
-    - `/Users/davidnorris/code/export-chats-data`
+    - Your archive directory (default: `/Users/davidnorris/code/export-chats-data`).
 
 4. Generate the current pending queue and browser exporter.
     - (This regenerates `.state/project_batch_console.js` from the refreshed inventory. If it reports Pending IDs: 0, no batch export is needed.)
@@ -162,7 +176,7 @@ recovery.
     - `cd /Users/davidnorris/code/export-chats-tooling && ruby capture_watch.rb`
 
 6. Copy and run the generated browser exporter.
-    - (Open the Adventure Finder project page in ChatGPT, paste the copied JavaScript into the browser’s developer console, and run it.)
+    - (Open the same ChatGPT Project, paste the copied JavaScript into the browser’s developer console, and run it. Follow the documented two-chat smoke test before a first full run.)
     - `cd /Users/davidnorris/code/export-chats-tooling && pbcopy < .state/project_batch_console.js`
 
 7.  Wait for local ingestion to finish.
@@ -170,6 +184,6 @@ recovery.
 
 8. Verify the archive.
     - `cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb`
-	- (look to confirm **Pending IDs: 0**)
-    - If IDs remain, investigate the watcher and browser output before retrying. Start a fresh watcher before running the regenerated exporter.
-    - When finished, stop caffeinate with Ctrl-C in its terminal.
+    - (Confirm **Pending IDs: 0**. This accounts for every ID in that inventory; rerun inventory to include newly added chats.)
+    - (If IDs remain, investigate the watcher and browser output before retrying. Start a fresh watcher before running the regenerated exporter.)
+    - (When finished, stop caffeinate with Ctrl-C in its terminal.)

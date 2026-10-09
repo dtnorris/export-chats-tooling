@@ -12,7 +12,7 @@ class ReconcileError < StandardError; end
 
 STATE_DIR = File.expand_path(".state", __dir__)
 DEFAULT_DATA_REPO = File.expand_path("../export-chats-data", __dir__)
-INVENTORY_GLOB = "*AdventureFinder Project Inventory.json"
+INVENTORY_GLOB = "*Project Inventory.json"
 QUEUE_SCHEMA = "adventurefinder-chat-pending-queue/v0.1"
 RECONCILIATION_SCHEMA = "adventurefinder-chat-reconciliation/v0.1"
 
