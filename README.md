@@ -88,6 +88,69 @@ Project inventories are saved as JSON and CSV. Git-ignored `.state/` files
 contain reconciliation results, pending IDs, capture status, and the generated
 browser-console batch script.
 
+### Import local Codex agent sessions
+
+`import_codex_sessions.rb` archives local Codex rollout JSONL files alongside
+the ChatGPT exports. It does not use the browser exporter, network, or `.state`.
+The original bytes go to `raw/codex/<full-session-id>.jsonl`; a readable
+`YYYY-MM-DD - <recorded-task-heading> [<id-prefix>].md` goes at the data
+repository root. The Markdown records the full session ID, start time, source
+file, status, and SHA-256 of its authoritative raw file. The date is the local
+start date encoded in the rollout filename (checked against the session's UTC
+timestamp); if absent, the UTC date is used. A heading explicitly present in a
+user message supplies the title; otherwise the title is `Codex Session <prefix>`.
+
+The importer reads `response_item` messages and paired tool calls/results in
+file order. `event_msg.item_completed` repeats some of the same activity, so
+user/agent messages are not rendered twice; command, file change, extension,
+and nested tool diagnostics appear as distinct execution entries. Long tool
+arguments and outputs remain complete in collapsible blocks. Developer
+instructions and internal reasoning do not enter the readable view. The raw
+JSONL retains them, along with full event records, accounting, and non-text
+payloads. No transcript synthesis or LLM title generation is performed.
+
+Run these from the tooling checkout. The default source is
+`~/.codex/sessions`, recursively including existing and future year/month
+folders. `--source` can restrict a run to a particular subtree. The default
+destination is the sibling private `export-chats-data` checkout, which must
+already exist.
+
+```bash
+cd /Users/davidnorris/code/export-chats-tooling
+ruby import_codex_sessions.rb \
+  --source /Users/davidnorris/.codex/sessions \
+  --data-repo /Users/davidnorris/code/export-chats-data --dry-run
+ruby import_codex_sessions.rb \
+  --source /Users/davidnorris/.codex/sessions \
+  --data-repo /Users/davidnorris/code/export-chats-data
+```
+
+For routine incremental imports, use `ruby
+import_codex_sessions.rb --dry-run` to review, followed by `ruby
+import_codex_sessions.rb`. `--verbose` also lists unchanged sessions; `--help`
+shows the CLI. A second import of identical source bytes leaves existing files
+untouched. A changed rollout with the same ID, duplicate source IDs, different
+existing Markdown, malformed records, or unsafe paths produces an explicit
+failure and nonzero exit. Incomplete sessions are labeled as such; subsequent
+growth is detected as a same-ID conflict rather than silently overwriting the
+earlier snapshot. After inspecting the old and new raw files, retain the old
+snapshot separately and move its raw and Markdown pair out of the archive
+before re-importing that session. There is no automatic update or deletion.
+If a run stops after its raw write but before Markdown is installed, rerun:
+an identical raw file is accepted and the missing Markdown is created.
+
+Verify an import by checking the printed counts and paths, comparing
+`shasum -a 256` on an original JSONL and its `raw/codex/` copy, then rerunning
+and confirming `unchanged` equals `discovered` with zero conflicts/failures.
+The parser rejects unknown response or execution item structures until their
+meaning is reviewed. It does not inline internal reasoning, developer messages,
+binary assets, full duplicate event representations, or token accounting in
+Markdown; inspect the lossless raw file for those. Keep the data checkout and
+source sessions private. The public tooling checkout contains only synthetic
+test data. Never delete original Codex sessions as a consequence of importing.
+
+Tests: `ruby -I. test/import_codex_sessions_test.rb` from this checkout.
+
 ## Reliability and Recovery
 
 The batch exporter processes one conversation at a time, with approximately
