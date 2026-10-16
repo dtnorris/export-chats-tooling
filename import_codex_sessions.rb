@@ -20,8 +20,9 @@ class CodexSessionImporter
   DEFAULT_DATA_REPO = File.expand_path("../export-chats-data", __dir__)
   ID = /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
   MAX_LINE_BYTES = 16 * 1024 * 1024
+  SETTLE_SECONDS = 2 * 60 * 60
 
-  def initialize(source:, data_repo:, dry_run: false, verbose: false, output: $stdout, errors: $stderr)
+  def initialize(source:, data_repo:, dry_run: false, verbose: false, settled_only: false, now: Time.now, output: $stdout, errors: $stderr)
     @source = File.realpath(File.expand_path(source))
     @data_repo = File.realpath(File.expand_path(data_repo))
     raise CodexImportError, "source is not a directory" unless File.directory?(@source)
@@ -29,6 +30,7 @@ class CodexSessionImporter
     raise CodexImportError, "source and destination overlap" if inside?(@source, @data_repo) || inside?(@data_repo, @source)
 
     @dry_run, @verbose, @output, @errors = dry_run, verbose, output, errors
+    @settled_only, @now = settled_only, now
   rescue Errno::ENOENT => e
     raise CodexImportError, "missing source or destination directory: #{e.message}"
   end
@@ -53,14 +55,20 @@ class CodexSessionImporter
       @errors.puts "CONFLICT duplicate session ID #{id}: #{files.join(', ')}"
     end
 
+    prefix_counts = identities.keys.group_by { |id| id[0, 8] }.transform_values(&:length)
     identities.each do |id, files|
       next if duplicates.key?(id)
 
       path = files.first
       begin
+        if @settled_only && !settled?(path)
+          counts[:skipped] += 1
+          @output.puts "SKIPPED #{id}: not a previous-day, two-hour-idle session" if @verbose
+          next
+        end
         session = parse(path)
         raise CodexImportError, "session ID changed while reading" unless session[:id] == id
-        result, raw_path, md_path = install(session, path)
+        result, raw_path, md_path = install(session, path, prefer_full_id: prefix_counts.fetch(id[0, 8]) > 1)
         counts[result] += 1
         @output.puts "#{result.to_s.upcase} #{id} -> #{relative(md_path)} (#{relative(raw_path)})" if @verbose || result != :unchanged
       rescue CodexImportError, SystemCallError, JSON::ParserError, ArgumentError => e
@@ -73,6 +81,14 @@ class CodexSessionImporter
   end
 
   private
+
+  # Returns whether a rollout path predates today and has been idle two hours.
+  # Raises CodexImportError on unrecognized filename dates; later resume is possible.
+  def settled?(path)
+    date = File.basename(path)[/\Arollout-(\d{4}-\d{2}-\d{2})T/, 1]
+    raise CodexImportError, "unrecognized rollout date for settled-only import" unless date
+    Date.iso8601(date) < @now.getlocal.to_date && File.mtime(path) <= @now - SETTLE_SECONDS
+  end
 
   def inside?(path, root)
     path == root || path.start_with?("#{root}/")
@@ -99,7 +115,10 @@ class CodexSessionImporter
       meta = row["payload"]
       id = meta.is_a?(Hash) && meta["id"]
       raise CodexImportError, "missing or unsafe session ID" unless id.is_a?(String) && ID.match?(id)
-      raise CodexImportError, "inconsistent session IDs" if meta["session_id"] && meta["session_id"] != id
+      # Codex assigns a distinct thread id to forked/subagent threads; session_id
+      # identifies their root session and need not match the thread id.
+      root_id = meta["session_id"]
+      raise CodexImportError, "invalid root session ID" unless root_id.nil? || (root_id.is_a?(String) && ID.match?(root_id))
       id.downcase
     end
   rescue JSON::ParserError => e
@@ -135,8 +154,23 @@ class CodexSessionImporter
 
         case row["type"]
         when "session_meta"
-          raise CodexImportError, "multiple session_meta records" if meta || record_count != 1
-          meta = payload
+          if record_count == 1
+            meta = payload
+          else
+            # Copied/resumed history can include earlier metadata. Only accept
+            # records for this thread or a root/parent named by its first record.
+            ancestor_id = payload["id"]
+            allowed_ids = %w[id session_id parent_thread_id forked_from_id].filter_map do |key|
+              value = meta[key]
+              value if value.is_a?(String) && ID.match?(value)
+            end
+            raise CodexImportError, "unrelated repeated session_meta" unless ancestor_id.is_a?(String) &&
+              ID.match?(ancestor_id) && allowed_ids.any? { |id| id.casecmp?(ancestor_id) }
+            ancestor_root = payload["session_id"]
+            raise CodexImportError, "invalid repeated root session ID" unless ancestor_root.nil? ||
+              (ancestor_root.is_a?(String) && ID.match?(ancestor_root))
+            private_count += 1
+          end
         when "response_item"
           case payload["type"]
           when "message"
@@ -163,14 +197,19 @@ class CodexSessionImporter
             id = payload["call_id"]
             raise CodexImportError, "tool result without preceding call: #{id.inspect}" unless calls.key?(id)
             name = calls.delete(id)
-            result = if payload["type"] == "function_call_output"
-              output = payload["output"]
-              raise CodexImportError, "function call output is not a string" unless output.is_a?(String)
-              output
-            else
-              content(payload["output"])
-            end
+            output = payload["output"]
+            # Codex permits either a raw string or structured items for both
+            # function and custom tool outputs; do not coerce other shapes.
+            raise CodexImportError, "unsupported tool result content" unless output.is_a?(String) || output.is_a?(Array)
+            result = output.is_a?(String) ? output : content(output)
             parts << "### Tool result: #{escape(name)} — #{label}\n\nCall ID: `#{escape(id)}`\n\n#{details('Result', result)}\n"
+          when "agent_message"
+            author = payload["author"]
+            recipient = payload["recipient"]
+            raise CodexImportError, "invalid agent message participants" unless author.is_a?(String) && !author.empty? &&
+              recipient.is_a?(String) && !recipient.empty?
+            body = agent_message_content(payload["content"])
+            parts << "### Inter-agent message — #{label}\n\nFrom: `#{escape(author)}`; to: `#{escape(recipient)}`.\n\n#{quoted(body)}\n"
           when "reasoning"
             private_count += 1
           else
@@ -192,11 +231,36 @@ class CodexSessionImporter
               parts << diagnostic
               diagnostic_count += 1
             end
-          when "task_started", "token_count"
-            # Lifecycle start and accounting are present in the raw rollout.
+          when "turn_aborted"
+            reason = payload["reason"]
+            turn_id = payload["turn_id"]
+            raise CodexImportError, "invalid turn abort event" unless
+              %w[interrupted replaced review_ended budget_limited].include?(reason) &&
+              (turn_id.nil? || (turn_id.is_a?(String) && !turn_id.empty?))
+            # An aborted turn does not necessarily end the entire session.
+            turn_info = turn_id ? "; turn: `#{escape(turn_id)}`" : ""
+            parts << "### Turn aborted — #{label}\n\nReason: `#{escape(reason)}`#{turn_info}. Full details: raw JSONL.\n"
+          when "task_started", "token_count", "thread_settings_applied"
+            # Lifecycle start, settings, and accounting are present in the raw rollout.
           else
             raise CodexImportError, "unsupported event message: #{payload['type'].inspect}"
           end
+        when "inter_agent_communication"
+          recipients = payload.fetch("other_recipients", [])
+          encrypted = payload["encrypted_content"]
+          raise CodexImportError, "invalid inter-agent communication" unless
+            %w[author recipient content].all? { |key| payload[key].is_a?(String) } &&
+            [true, false].include?(payload["trigger_turn"]) &&
+            recipients.is_a?(Array) && recipients.all? { |value| value.is_a?(String) } &&
+            (encrypted.nil? || encrypted.is_a?(String))
+          # Routing records can mirror response_item agent messages. Retain raw only.
+        when "inter_agent_communication_metadata"
+          raise CodexImportError, "invalid inter-agent metadata" unless [true, false].include?(payload["trigger_turn"])
+          # Internal conversation routing is retained in the authoritative raw JSONL.
+        when "compacted"
+          raise CodexImportError, "invalid compaction record" unless payload["message"].is_a?(String)
+          # Compaction summaries may include internal/private context. Raw only.
+          private_count += 1
         when "turn_context", "world_state", "token_usage_record"
           # Execution context and accounting are recoverable from the raw JSONL.
         else
@@ -207,7 +271,8 @@ class CodexSessionImporter
     raise CodexImportError, "missing session_meta" unless meta
     id = meta["id"]
     raise CodexImportError, "missing or unsafe session ID" unless id.is_a?(String) && ID.match?(id)
-    raise CodexImportError, "inconsistent session IDs" if meta["session_id"] && meta["session_id"] != id
+    root_id = meta["session_id"]
+    raise CodexImportError, "invalid root session ID" unless root_id.nil? || (root_id.is_a?(String) && ID.match?(root_id))
     raise CodexImportError, "session filename ID differs from metadata" if File.basename(path) =~ /([0-9a-f-]{36})\.jsonl\z/i && Regexp.last_match(1).downcase != id.downcase
     started = Time.iso8601(meta.fetch("timestamp"))
     filename_date = File.basename(path)[/\Arollout-(\d{4}-\d{2}-\d{2})T/, 1]
@@ -219,12 +284,14 @@ class CodexSessionImporter
     title = title_from(users, id)
     raw_rel = "raw/codex/#{id.downcase}.jsonl"
     md_name = "#{date} - #{safe_title(title)} [#{id[0, 8].downcase}].md"
+    full_md_name = "#{date} - #{safe_title(title)} [#{id.downcase}].md"
     git = meta["git"].is_a?(Hash) ? meta["git"] : {}
+    root_suffix = root_id && root_id.downcase != id.downcase ? "\n- Root Session ID: `#{root_id}`" : ""
     header = <<~MARKDOWN
       # #{title}
 
       - Source: Codex rollout JSONL
-      - Session ID: `#{id}`
+      - Session ID: `#{id}`#{root_suffix}
       - Started: `#{started.iso8601(3)}`
       - Source date: `#{date}` (rollout filename; UTC timestamp above)
       - Status: #{lifecycle}
@@ -241,7 +308,7 @@ class CodexSessionImporter
 
     MARKDOWN
     parts << "\nUnanswered tool calls: #{calls.keys.map { |key| "`#{escape(key)}`" }.join(', ')}\n" unless calls.empty?
-    { id: id.downcase, raw_rel: raw_rel, md_name: md_name, digest: digest.hexdigest,
+    { id: id.downcase, raw_rel: raw_rel, md_name: md_name, full_md_name: full_md_name, digest: digest.hexdigest,
       markdown: header + parts.join("\n") + "\n" }
   rescue KeyError, TypeError, RangeError => e
     raise CodexImportError, "invalid session metadata: #{e.message}"
@@ -259,6 +326,27 @@ class CodexSessionImporter
     end.join("\n")
   end
 
+  # Render Codex inter-agent content, preserving plaintext while never exposing
+  # partially encrypted messages. Accepts a content-item array, returns text or
+  # a raw-archive placeholder, and raises CodexImportError on invalid items.
+  def agent_message_content(items)
+    raise CodexImportError, "agent message content is not an array" unless items.is_a?(Array)
+    texts = items.map do |item|
+      raise CodexImportError, "invalid agent message content item" unless item.is_a?(Hash)
+      case item["type"]
+      when "input_text"
+        raise CodexImportError, "invalid agent message text" unless item["text"].is_a?(String)
+        item["text"]
+      when "encrypted_content"
+        raise CodexImportError, "invalid encrypted agent message" unless item["encrypted_content"].is_a?(String)
+        nil
+      else
+        raise CodexImportError, "unsupported agent message content: #{item['type'].inspect}"
+      end
+    end
+    texts.include?(nil) ? "[encrypted inter-agent message; see raw JSONL]" : texts.join("\n")
+  end
+
   def execution_diagnostic(item, label)
     case item["type"]
     when "CommandExecution"
@@ -270,6 +358,16 @@ class CodexSessionImporter
       "### Nested tool execution — #{label}\n\n`#{escape(item['server'])}.#{escape(item['tool'])}` status: `#{escape(item['status'])}`. Arguments and result: enclosing tool call/result and raw JSONL.\n"
     when "Extension"
       "### Extension activity — #{label}\n\nKind: `#{escape(item['kind'])}`. Query/action and results: enclosing tool call/result and raw JSONL.\n"
+    when "ContextCompaction"
+      id = item["id"]
+      raise CodexImportError, "invalid context compaction item" unless id.is_a?(String) && !id.empty?
+      "### Context compaction — #{label}\n\nCheckpoint: `#{escape(id)}`. Compaction contents: raw JSONL.\n"
+    when "SubAgentActivity"
+      kind = item["kind"]
+      thread_id = item["agent_thread_id"]
+      raise CodexImportError, "invalid subagent activity" unless %w[started interacted interrupted completed].include?(kind) &&
+        thread_id.is_a?(String) && ID.match?(thread_id)
+      "### Subagent activity — #{label}\n\nKind: `#{escape(kind)}`; thread: `#{escape(thread_id)}`. Full details: raw JSONL.\n"
     when "UserMessage", "AgentMessage", "Reasoning"
       nil # These mirror response items; reasoning stays private.
     else
@@ -319,15 +417,33 @@ class CodexSessionImporter
     end
   end
 
-  def install(session, source_path)
+  # Archives parsed raw and Markdown files without overwriting existing evidence.
+  # Returns [status, raw_path, md_path]; raises CodexImportError on conflicts.
+  def install(session, source_path, prefer_full_id: false)
     raw = File.join(@data_repo, session[:raw_rel])
-    md = File.join(@data_repo, session[:md_name])
-    [raw, md].each { |path| safe_destination!(path) }
+    legacy_md = File.join(@data_repo, session[:md_name])
+    full_md = File.join(@data_repo, session[:full_md_name])
+    [raw, legacy_md, full_md].each { |path| safe_destination!(path) }
     raw_exists = File.exist?(raw)
-    md_exists = File.exist?(md)
     if raw_exists && Digest::SHA256.file(raw).hexdigest != session[:digest]
       raise CodexImportError, "same-ID raw content changed; inspect and resolve explicitly: #{relative(raw)}"
     end
+    legacy_content = File.binread(legacy_md) if File.exist?(legacy_md)
+    legacy_matches = legacy_content == session[:markdown].b
+    # Retain old eight-character names exactly, but give colliding new sessions
+    # a full-ID name. Never route a modified archived transcript around its check.
+    if raw_exists && legacy_content && !legacy_matches &&
+        legacy_content.match?(/^\- Session ID: `#{Regexp.escape(session[:id])}`$/)
+      raise CodexImportError, "different existing Markdown: #{relative(legacy_md)}"
+    end
+    md = if legacy_matches
+      legacy_md
+    elsif File.exist?(full_md) || prefer_full_id
+      full_md
+    else
+      legacy_md
+    end
+    md_exists = File.exist?(md)
     if md_exists && File.binread(md) != session[:markdown].b
       raise CodexImportError, "different existing Markdown or filename collision: #{relative(md)}"
     end
@@ -365,11 +481,12 @@ end
 if $PROGRAM_NAME == __FILE__
   options = { source: CodexSessionImporter::DEFAULT_SOURCE,
               data_repo: CodexSessionImporter::DEFAULT_DATA_REPO,
-              dry_run: false, verbose: false }
+              dry_run: false, verbose: false, settled_only: false }
   parser = OptionParser.new do |cli|
-    cli.banner = "Usage: ruby import_codex_sessions.rb [--source DIR] [--data-repo DIR] [--dry-run] [--verbose]"
+    cli.banner = "Usage: ruby import_codex_sessions.rb [--source DIR] [--data-repo DIR] [--settled-only] [--dry-run] [--verbose]"
     cli.on("--source DIR", "Recursively search Codex rollouts") { |value| options[:source] = value }
     cli.on("--data-repo DIR", "Existing private archive directory") { |value| options[:data_repo] = value }
+    cli.on("--settled-only", "Skip today's rollouts and those modified within two hours") { options[:settled_only] = true }
     cli.on("--dry-run", "Report actions without changing the archive") { options[:dry_run] = true }
     cli.on("--verbose", "Also list unchanged sessions") { options[:verbose] = true }
     cli.on("--help", "Show this help") { puts cli; exit 0 }

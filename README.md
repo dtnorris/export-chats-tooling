@@ -116,14 +116,32 @@ destination is the sibling private `export-chats-data` checkout, which must
 already exist.
 
 ```bash
+# Import completed Codex sessions from previous days.
+# --settled-only skips today's sessions and files modified within the last 2 hours,
+# reducing the risk of archiving an active or recently resumed session.
+
 cd /Users/davidnorris/code/export-chats-tooling
+
+# 1. Preview eligible imports without changing the archive.
 ruby import_codex_sessions.rb \
   --source /Users/davidnorris/.codex/sessions \
-  --data-repo /Users/davidnorris/code/export-chats-data --dry-run
+  --data-repo /Users/davidnorris/code/export-chats-data \
+  --settled-only --dry-run
+
+# 2. Import eligible sessions.
 ruby import_codex_sessions.rb \
   --source /Users/davidnorris/.codex/sessions \
-  --data-repo /Users/davidnorris/code/export-chats-data
+  --data-repo /Users/davidnorris/code/export-chats-data \
+  --settled-only
+
+# 3. Verify idempotency: imported=0, failed=0, conflicting=0.
+ruby import_codex_sessions.rb \
+  --source /Users/davidnorris/.codex/sessions \
+  --data-repo /Users/davidnorris/code/export-chats-data \
+  --settled-only --dry-run
 ```
+
+**Note:** `--settled-only` is a conservative daily-import safeguard, not proof that a session is permanently complete. Older Codex sessions can still be resumed. The importer preserves existing archives and rejects changed same-ID content rather than silently overwriting it. Sessions with colliding short-ID filename prefixes receive distinct Markdown filenames.
 
 For routine incremental imports, use `ruby
 import_codex_sessions.rb --dry-run` to review, followed by `ruby
