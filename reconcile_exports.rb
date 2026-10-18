@@ -40,25 +40,61 @@ module ReconcileHelpers
     end
   end
 
-  def time_date_candidates(value)
-    return [] if value.nil? || value == ""
+  # Encode parsed JSON for the browser's checksum: type tags, insertion order,
+  # and big-endian IEEE-754 numbers. Returns text; accepts only JSON-shaped input.
+  def checkpoint_encoding(value)
+    case value
+    when NilClass then "n"
+    when TrueClass then "b1"
+    when FalseClass then "b0"
+    when String then "s#{JSON.generate(value)}"
+    when Numeric then "d#{[value.zero? ? 0.0 : value.to_f].pack("G").unpack1("H*")}"
+    when Array then "[#{value.map { |entry| checkpoint_encoding(entry) }.join(",")}]"
+    when Hash then "{#{value.map { |key, entry| "#{JSON.generate(key)}:#{checkpoint_encoding(entry)}" }.join(",")}}"
+    else raise ReconcileError, "non-JSON checkpoint value"
+    end
+  end
 
-    time =
-      case value
-      when Numeric
-        Time.at(value).utc
-      when String
-        Time.parse(value)
-      else
-        return []
+  # Normalize epoch seconds or strict zoned ISO input into UTC milliseconds and a
+  # valid/missing/invalid status. Returns a Hash; invalid evidence never invents dates.
+  # This is the timestamp contract in AUTOMATED_EXPORT.md, shared with the browser.
+  def inventory_timestamp(value)
+    return { value: nil, status: "missing" } if value.nil? || value == ""
+
+    milliseconds =
+      if value.is_a?(Integer) || value.is_a?(Float)
+        return { value: nil, status: "invalid" } unless value.finite?
+        scaled = value * 1000
+        lower = scaled.floor
+        lower + (scaled - lower >= 0.5 ? 1 : 0)
+      elsif value.is_a?(String)
+        match = /\A(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:\d{2})\z/.match(value)
+        return { value: nil, status: "invalid" } unless match
+        year, month, day, hour, minute, second = match.captures.first(6).map(&:to_i)
+        zone = match[8]
+        offset_hour = zone == "Z" ? 0 : zone[1, 2].to_i
+        offset_minute = zone == "Z" ? 0 : zone[4, 2].to_i
+        return { value: nil, status: "invalid" } unless year.between?(1, 9999) && Date.valid_date?(year, month, day, Date::GREGORIAN) &&
+          hour <= 23 && minute <= 59 && second <= 59 && offset_hour <= 14 && offset_minute <= 59 &&
+          (offset_hour != 14 || offset_minute.zero?) && zone != "-00:00"
+        (Time.iso8601(value).to_r * 1000).to_i
       end
+    return { value: nil, status: "invalid" } unless milliseconds &&
+      milliseconds.between?(-62_135_596_800_000, 253_402_300_799_999)
 
-    [
-      time.utc.strftime("%Y-%m-%d"),
-      time.getlocal.strftime("%Y-%m-%d")
-    ].uniq
-  rescue ArgumentError, RangeError
-    []
+    { value: Time.at(Rational(milliseconds, 1000)).utc.iso8601(3), status: "valid" }
+  rescue ArgumentError, RangeError, FloatDomainError
+    { value: nil, status: "invalid" }
+  end
+
+  # Return UTC/local creation-date candidates for supported inventory evidence;
+  # missing/invalid input returns [], with no permissive parsing or current-date fallback.
+  def time_date_candidates(value)
+    normalized = inventory_timestamp(value)
+    return [] unless normalized[:status] == "valid"
+
+    time = Time.iso8601(normalized[:value])
+    [time.utc.strftime("%Y-%m-%d"), time.getlocal.strftime("%Y-%m-%d")].uniq
   end
 
   def atomic_json(path, object)
@@ -75,6 +111,8 @@ module ReconcileHelpers
   end
 end
 
+# Match known inventory IDs to archival evidence and write resumable queues.
+# Accepts explicit archive/inventory paths; raises ReconcileError on unsafe evidence.
 class ExportReconciler
   include ReconcileHelpers
 
@@ -88,6 +126,8 @@ class ExportReconciler
     raise ReconcileError, "inventory file not found" unless @inventory_path && File.file?(@inventory_path)
   end
 
+  # Read and validate the selected inventory, reconcile known IDs, then write local
+  # queues/runners and return a report. Raises ReconcileError/JSON/file errors.
   def run
     inventory = JSON.parse(File.binread(inventory_path))
     project_id = inventory.fetch("project_id")
@@ -99,9 +139,10 @@ class ExportReconciler
     end
 
     observed_count = inventory["observed_conversation_count"]
-    if observed_count && observed_count != records.length
+    count = inventory["schema"] == "adventurefinder-chat-project-inventory/v0.2" ? inventory["known_conversation_count"] : observed_count
+    if count && count != records.length
       raise ReconcileError,
-        "inventory observed count #{observed_count} does not match #{records.length} unique records"
+        "inventory record count #{count} does not match #{records.length} unique records"
     end
 
     markdown_payloads = unique_markdown_payloads
@@ -165,6 +206,9 @@ class ExportReconciler
       "inventory_sha256" => ReconcileHelpers.sha256_file(inventory_path),
       "project_id" => project_id,
       "inventory_count" => records.length,
+      "inventory_coverage" => inventory.fetch("coverage", "legacy-unverified"),
+      "observed_conversation_count" => observed_count,
+      "full_audit" => inventory["full_audit"],
       "unique_markdown_payload_count" => markdown_payloads.length,
       "completed_conversation_count" => completed_ids.length,
       "pending_conversation_count" => pending.length,
@@ -179,6 +223,9 @@ class ExportReconciler
       "inventory_file" => report.fetch("inventory_file"),
       "inventory_sha256" => report.fetch("inventory_sha256"),
       "inventory_count" => records.length,
+      "inventory_coverage" => inventory.fetch("coverage", "legacy-unverified"),
+      "observed_conversation_count" => observed_count,
+      "full_audit" => inventory["full_audit"],
       "completed_count" => completed_ids.length,
       "pending_count" => pending.length,
       "pending" => pending.map do |record|
@@ -201,6 +248,7 @@ class ExportReconciler
     })
     ReconcileHelpers.atomic_json(File.join(STATE_DIR, "pending_ids.json"), queue)
     write_console_runner(queue)
+    write_inventory_runner(inventory)
 
     print_summary(report)
     report
@@ -226,39 +274,160 @@ class ExportReconciler
     candidates.max_by { |path| [File.mtime(path), path] }
   end
 
+  # Return cumulative v0.2 records or legacy full JSON records, normalized to UTC.
+  # Reject malformed/duplicate IDs rather than hiding them by raw-page deduplication.
+  # Legacy raw pages remain preferred because v0.1 normalized ISO timestamps to null.
   def inventory_records(inventory)
-    raw_pages = inventory["raw_pages"]
-    if raw_pages.is_a?(Array) && raw_pages.any?
-      items = raw_pages.flat_map do |page|
-        values = page.is_a?(Hash) ? page["items"] : nil
-        values.is_a?(Array) ? values : []
+    schema = inventory["schema"]
+    if schema == "adventurefinder-chat-project-inventory/v0.2"
+      values = inventory["conversations"]
+      validate_cumulative_inventory(inventory)
+    elsif schema.nil? || schema == "adventurefinder-chat-project-inventory/v0.1"
+      raw_pages = inventory["raw_pages"]
+      values = if raw_pages.is_a?(Array) && raw_pages.any?
+        raw_pages.flat_map do |page|
+          raise ReconcileError, "inventory raw page has no items array" unless page.is_a?(Hash) && page["items"].is_a?(Array)
+          page["items"]
+        end
+      else
+        inventory["conversations"]
       end
-
-      by_id = {}
-      items.each do |item|
-        next unless item.is_a?(Hash)
-        id = item["id"]
-        raise ReconcileError, "inventory item missing id" unless id.is_a?(String) && !id.empty?
-
-        by_id[id] ||= {
-          "id" => id,
-          "title" => item["title"],
-          "create_time" => item["create_time"],
-          "update_time" => item["update_time"]
-        }
-      end
-      return by_id.values
+    else
+      raise ReconcileError, "unsupported inventory schema"
     end
-
-    values = inventory["conversations"]
     raise ReconcileError, "inventory has neither raw_pages nor conversations" unless values.is_a?(Array)
 
+    seen = {}
     values.map do |item|
       raise ReconcileError, "conversation inventory item is not an object" unless item.is_a?(Hash)
       id = item["id"]
-      raise ReconcileError, "conversation inventory item missing id" unless id.is_a?(String) && !id.empty?
-      item.slice("id", "title", "create_time", "update_time")
+      raise ReconcileError, "conversation inventory item missing id" unless id.is_a?(String) && !id.strip.empty?
+      raise ReconcileError, "inventory contains duplicate conversation IDs" if seen[id]
+      seen[id] = true
+      record = item.slice("id", "title")
+      %w[create_time update_time].each do |field|
+        normalized = ReconcileHelpers.inventory_timestamp(item[field])
+        record[field] = normalized[:value]
+      end
+      record
     end
+  end
+
+  # Validate the explicit cumulative/partial contract before reconciliation writes.
+  # Input is parsed JSON; raises ReconcileError on inconsistent counts or provenance.
+  # Verify the same checksum as the browser before using or embedding a checkpoint.
+  def validate_cumulative_inventory(inventory)
+    records = inventory["conversations"]
+    pages = inventory["raw_pages"]
+    audit = inventory["full_audit"]
+    scan_time = inventory["scan_started_at"]
+    unless records.is_a?(Array) && pages.is_a?(Array) && pages.any? && audit.is_a?(Hash) &&
+        inventory["producer"] == "project_inventory.js/ECT-01" &&
+        inventory["account_id"].is_a?(String) && !inventory["account_id"].strip.empty? &&
+        inventory["project_id"].is_a?(String) && !inventory["project_id"].strip.empty? &&
+        inventory["checkpoint_sha256"].is_a?(String) && /\A[0-9a-f]{64}\z/.match?(inventory["checkpoint_sha256"]) &&
+        ReconcileHelpers.inventory_timestamp(scan_time)[:value] == scan_time && scan_time &&
+        %w[exhaustive incremental].include?(inventory["coverage"]) &&
+        inventory["known_conversation_count"] == records.length && inventory["page_count"] == pages.length
+      raise ReconcileError, "invalid cumulative inventory contract"
+    end
+    checksum = Digest::SHA256.hexdigest(ReconcileHelpers.checkpoint_encoding(inventory.reject { |key, _| key == "checkpoint_sha256" }))
+    raise ReconcileError, "inventory checkpoint checksum mismatch" unless checksum == inventory["checkpoint_sha256"]
+
+    observed = records.select { |record| record.is_a?(Hash) && record["observed_in_scan"] == true }
+    unless records.all? { |record| record.is_a?(Hash) && [true, false].include?(record["observed_in_scan"]) } &&
+        observed.length == inventory["observed_conversation_count"] &&
+        observed.all? { |record| record["last_observed_at"] == scan_time }
+      raise ReconcileError, "inconsistent cumulative observation counts"
+    end
+    records.each do |record|
+      unless record["id"].is_a?(String) && !record["id"].strip.empty? &&
+          ReconcileHelpers.inventory_timestamp(record["last_observed_at"])[:value] == record["last_observed_at"] &&
+          record["last_observed_at"] && record["last_observed_at"] <= scan_time
+        raise ReconcileError, "invalid cumulative record provenance"
+      end
+      %w[create_time update_time].each do |field|
+        unless %w[valid missing invalid].include?(record["#{field}_status"]) &&
+            ReconcileHelpers.inventory_timestamp(record[field])[:value] == record[field] &&
+            (!record[field].nil? == (record["#{field}_status"] == "valid"))
+          raise ReconcileError, "invalid cumulative normalized timestamp"
+        end
+      end
+    end
+    audit_time = audit["started_at"]
+    unless audit_time && ReconcileHelpers.inventory_timestamp(audit_time)[:value] == audit_time &&
+        audit_time <= scan_time && audit["id"] == audit_time &&
+        audit["page_count"].is_a?(Integer) && audit["page_count"].between?(1, 10_000) &&
+        audit["observed_count"].is_a?(Integer) && audit["observed_count"] >= 0 &&
+        [true, false].include?(audit["ordered"]) && [true, false].include?(audit["timestamps_usable"]) &&
+        inventory["watermark"] == scan_time && inventory["overlap_ms"] == 604_800_000 &&
+        inventory["audit_interval_ms"] == 604_800_000 && pages.length <= 10_000 &&
+        records.count { |record| record["last_full_audit_at"] == audit_time } == audit["observed_count"]
+      raise ReconcileError, "invalid cumulative full-audit lineage"
+    end
+    records.each do |record|
+      last_audit = record["last_full_audit_at"]
+      unless last_audit.nil? || (ReconcileHelpers.inventory_timestamp(last_audit)[:value] == last_audit && last_audit <= audit_time)
+        raise ReconcileError, "invalid cumulative full-audit observation"
+      end
+    end
+    cursors = { "0" => true }
+    raw = pages.each_with_index.flat_map do |page, index|
+      raise ReconcileError, "malformed cumulative raw page" unless page.is_a?(Hash) && page["items"].is_a?(Array)
+      cursor = page["cursor"]
+      if (!cursor.nil? && (!cursor.is_a?(String) || cursor.strip.empty? || cursors[cursor])) ||
+          (index < pages.length - 1 && cursor.nil?) || (page["items"].empty? && !cursor.nil?)
+        raise ReconcileError, "invalid cumulative cursor coverage"
+      end
+      cursors[cursor] = true unless cursor.nil?
+      page["items"]
+    end
+    raw_ids = raw.map { |item| item.is_a?(Hash) ? item["id"] : nil }
+    unless raw_ids.compact.length == raw_ids.length && raw_ids.uniq.length == raw_ids.length &&
+        raw_ids.sort == observed.map { |record| record["id"] }.sort
+      raise ReconcileError, "cumulative raw IDs disagree with observed records"
+    end
+    by_id = records.to_h { |record| [record["id"], record] }
+    ordered = true
+    usable = true
+    last_update = nil
+    raw.each do |item|
+      record = by_id.fetch(item["id"])
+      update = ReconcileHelpers.inventory_timestamp(item["update_time"])[:value]
+      usable = false unless update
+      ordered = false if update && last_update && update > last_update
+      last_update = update
+      %w[create_time update_time].each do |field|
+        normalized = ReconcileHelpers.inventory_timestamp(item[field])
+        unless normalized[:value] == record[field] && normalized[:status] == record["#{field}_status"]
+          raise ReconcileError, "cumulative raw timestamps disagree with records"
+        end
+      end
+      raise ReconcileError, "cumulative raw title disagrees with records" unless
+        (item["title"].is_a?(String) ? item["title"] : nil) == record["title"]
+    end
+    if inventory["coverage"] == "exhaustive" &&
+        (pages.last["cursor"] || audit_time != scan_time || audit["observed_count"] != observed.length ||
+         audit["page_count"] != pages.length || audit["ordered"] != ordered || audit["timestamps_usable"] != usable)
+      raise ReconcileError, "exhaustive coverage was not exhausted"
+    end
+    if inventory["coverage"] == "incremental"
+      cutoff = inventory["cutoff"]
+      unless pages.last["cursor"] && ordered && usable && audit["ordered"] && audit["timestamps_usable"] &&
+          cutoff && ReconcileHelpers.inventory_timestamp(cutoff)[:value] == cutoff && last_update && last_update < cutoff &&
+          pages.length < 100 && Time.iso8601(scan_time) - Time.iso8601(audit_time) < 604_800
+        raise ReconcileError, "unsafe incremental stopping evidence"
+      end
+    end
+  end
+
+  # Embed a saved v0.2 checkpoint and the inventory script for the next daily run.
+  # Legacy files start a fresh full scan; file/JSON errors propagate, no archive writes.
+  def write_inventory_runner(inventory)
+    previous = inventory["schema"] == "adventurefinder-chat-project-inventory/v0.2" ? inventory : nil
+    script = File.read(File.expand_path("project_inventory.js", __dir__), encoding: Encoding::UTF_8)
+    content = "window.__chatProjectInventoryPrevious = #{JSON.generate(previous)};\n#{script}"
+    File.binwrite(File.join(STATE_DIR, "project_inventory_console.js"), content)
   end
 
   def unique_markdown_payloads
@@ -362,12 +531,14 @@ class ExportReconciler
     File.expand_path(path)
   end
 
+  # Print known-ID counts and generated paths from a validated report; returns nil.
   def print_summary(report)
     puts "AdventureFinder export reconciliation"
-    puts "Inventory:        #{report.fetch("inventory_count")} conversations"
+    puts "Known inventory:   #{report.fetch("inventory_count")} conversations (#{report.fetch("inventory_coverage")})"
     puts "Existing payloads: #{report.fetch("unique_markdown_payload_count")} unique Markdown payloads"
     puts "Completed IDs:     #{report.fetch("completed_conversation_count")}"
     puts "Pending IDs:       #{report.fetch("pending_conversation_count")}"
+    puts "Counts cover known IDs only; completion does not establish discovery or content freshness."
     puts "Unresolved files:  #{report.fetch("unresolved_markdown_payloads").length} payloads"
     puts
     puts "Wrote:"
@@ -375,6 +546,7 @@ class ExportReconciler
     puts "  #{File.join(STATE_DIR, "completed_ids.json")}"
     puts "  #{File.join(STATE_DIR, "pending_ids.json")}"
     puts "  #{File.join(STATE_DIR, "project_batch_console.js")}"
+    puts "  #{File.join(STATE_DIR, "project_inventory_console.js")}"
   end
 end
 

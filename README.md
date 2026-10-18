@@ -29,9 +29,10 @@ dynamically loaded page content.
 
 ### Project-Wide Export Workflow
 
-1. **Inventory** — `project_inventory.js` enumerates the conversations in an
-   open ChatGPT Project, downloading conversation IDs, titles, timestamps, and
-inventory metadata as JSON and CSV.
+1. **Inventory** — project_inventory.js establishes an exhaustive baseline for
+   the open project, then uses saved checkpoints for overlapping daily discovery.
+JSON/CSV retain every known ID; seven-day audits restore exhaustive listing
+coverage.
 2. **Reconcile** — `reconcile_exports.rb` compares that inventory against
    previously archived Markdown and raw JSON, identifies missing conversations,
 and generates a pending queue in `.state/`.
@@ -45,8 +46,10 @@ the separate data repository.
    conversation IDs from the pending queue. Interrupted or incomplete exports
 remain eligible for subsequent attempts.
 
-The workflow is intentionally incremental: existing exports are reused rather
-than blindly downloaded again.
+Daily discovery depends on the undocumented endpoint's ordering and visibility.
+Existing captures are reused; updated inventory metadata does not recapture
+changed content. See the [inventory contract](AUTOMATED_EXPORT.md#inventory-contract-for-downstream-consumers-ect-02)
+for coverage, timestamps, lineage and audit recovery guarantees.
 
 ### Repository Components
 
@@ -84,9 +87,10 @@ view rather than a complete representation of the raw conversation.
 
 **Inventory and checkpoints**
 
-Project inventories are saved as JSON and CSV. Git-ignored `.state/` files
-contain reconciliation results, pending IDs, capture status, and the generated
-browser-console batch script.
+Project inventories are saved as cumulative JSON checkpoints and inspection
+CSV. Git-ignored .state/ files contain reconciliation results, pending IDs,
+capture status, and generated inventory/batch console scripts. Retain previous
+JSONs for recovery; CSV alone cannot authorize daily scans.
 
 ### Import local Codex agent sessions
 
@@ -197,8 +201,10 @@ account-data export service.
 It relies on ChatGPT's authenticated web interface and undocumented internal
 endpoints, which may change. Project inventory uses the ID of the open ChatGPT
 Project and supports any conversation count, with an optional exact-count audit.
-Pagination checks validate the returned listing; they cannot prove an atomic
-server snapshot. This is not a general account-wide exporter. Historical
+Partial discovery assumes descending update ordering across the unseen suffix;
+a locally ordered prefix cannot establish it. Seven-day audits bound recovery
+for visible backdated records during successful daily operation. Pagination
+checks cannot prove an atomic server snapshot or recover records never exposed. This is not a general account-wide exporter. Historical
 AdventureFinder schema names remain for compatibility, and checkpoints support
 one project per tooling checkout.
 
@@ -223,6 +229,8 @@ Offline inventory regression tests use Node.js 18 or later:
 
 ```bash
 node --test test/project_inventory.test.js
+ruby -I. test/reconcile_exports_test.rb
+ruby -I. test/import_codex_sessions_test.rb
 ```
 
 ---
@@ -244,12 +252,17 @@ and instructions for keeping projects separate.
     - (Open the ChatGPT Project you want to archive, paste the copied JavaScript into its developer console, and run it.)
     - (No expected count is required. If you previously enabled the optional audit, clear it with `delete window.__chatProjectInventoryExpectedCount` first.)
     - `cd /Users/davidnorris/code/export-chats-tooling && pbcopy < project_inventory.js`
+    - `cd /Users/davidnorris/code/export-chats-tooling && pbcopy < .state/project_inventory_console.js`
+    - First run: copy project_inventory.js from the tooling checkout.
+    - Later runs: copy .state/project_inventory_console.js after reconciliation.
+    - Use pbcopy < the chosen script, then paste it into the browser console.
+    - A full audit is automatic every seven days. Set window.__chatProjectInventoryFullAudit = true to force one, then clear it afterward.
 
 3. (Move the newly downloaded inventory JSON and CSV files into:)
     - Your archive directory (default: `/Users/davidnorris/code/export-chats-data`).
 
 4. Generate the current pending queue and browser exporter.
-    - (This regenerates `.state/project_batch_console.js` from the refreshed inventory. If it reports Pending IDs: 0, no batch export is needed.)
+    - (This regenerates the next inventory console script and batch exporter. Pending IDs: 0 means no known uncaptured IDs; it does not establish unseen-record discovery or capture changed content.)
     - `cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb`
 
 5. Start the capture watcher in a separate terminal.
@@ -265,6 +278,6 @@ and instructions for keeping projects separate.
 
 8. Verify the archive.
     - `cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb`
-    - (Confirm **Pending IDs: 0**. This accounts for every ID in that inventory; rerun inventory to include newly added chats.)
+    - (Confirm **Pending IDs: 0** for cumulative known IDs. Partial discovery has conditional coverage; full audits recover visible records outside overlap. Existing captures do not prove changed content was archived.)
     - (If IDs remain, investigate the watcher and browser output before retrying. Start a fresh watcher before running the regenerated exporter.)
     - (When finished, stop caffeinate with Ctrl-C in its terminal.)
