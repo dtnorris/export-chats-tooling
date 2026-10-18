@@ -220,4 +220,18 @@ class ReconcileExportsTest < Minitest::Test
     assert File.file?(File.join(tooling, ".state", "project_inventory_console.js"))
     refute Dir.exist?(File.join(@data, "raw"))
   end
+  # Preserve non-ASCII titles when embedding a full checkpoint into the next browser script.
+  def test_unicode_titles_generate_valid_next_inventory_script
+    inventory = cumulative
+    inventory["conversations"].first["title"] = "Café · 東京 😀"
+    inventory["raw_pages"].first["items"].first["title"] = "Café · 東京 😀"
+    inventory["conversations"][1]["title"] = "Zoë — São Paulo"
+
+    report = reconcile(sign(inventory))
+    generated = File.read(File.join(@state, "project_inventory_console.js"), encoding: Encoding::UTF_8)
+    assert_equal 3, report["inventory_count"]
+    assert generated.valid_encoding?
+    assert_includes generated, "Café · 東京 😀"
+    assert_includes generated, "Zoë — São Paulo"
+  end
 end

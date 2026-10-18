@@ -425,7 +425,7 @@ class ExportReconciler
   # Legacy files start a fresh full scan; file/JSON errors propagate, no archive writes.
   def write_inventory_runner(inventory)
     previous = inventory["schema"] == "adventurefinder-chat-project-inventory/v0.2" ? inventory : nil
-    script = File.binread(File.expand_path("project_inventory.js", __dir__))
+    script = File.read(File.expand_path("project_inventory.js", __dir__), encoding: Encoding::UTF_8)
     content = "window.__chatProjectInventoryPrevious = #{JSON.generate(previous)};\n#{script}"
     File.binwrite(File.join(STATE_DIR, "project_inventory_console.js"), content)
   end
