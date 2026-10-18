@@ -15,7 +15,8 @@ class ReconcileExportsTest < Minitest::Test
 
   # Create an archive and redirect state inside the temporary root; no real data writes.
   def setup
-    @root = Dir.mktmpdir("reconcile-test-")
+    # Resolve macOS temporary-directory aliases before strict symlink validation.
+    @root = File.realpath(Dir.mktmpdir("reconcile-test-"))
     @data = File.join(@root, "data")
     @state = File.join(@root, "state")
     FileUtils.mkdir_p(@data)

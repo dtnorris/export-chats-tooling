@@ -16,7 +16,8 @@ class SnapshotArchiveTest < Minitest::Test
 
   # Isolate state/archive/download writes and preserve the existing state constant.
   def setup
-    @root = Dir.mktmpdir("snapshot-test-")
+    # Resolve macOS temporary-directory aliases before strict symlink validation.
+    @root = File.realpath(Dir.mktmpdir("snapshot-test-"))
     @data, @downloads, @state = %w[data downloads state].map { |name| File.join(@root, name) }
     FileUtils.mkdir_p([@data, @downloads, @state])
     @original_state = STATE_DIR
