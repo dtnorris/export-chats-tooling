@@ -34,22 +34,24 @@ dynamically loaded page content.
 JSON/CSV retain every known ID; seven-day audits restore exhaustive listing
 coverage.
 2. **Reconcile** — `reconcile_exports.rb` compares that inventory against
-   previously archived Markdown and raw JSON, identifies missing conversations,
-and generates a pending queue in `.state/`.
+   previously archived evidence, selects new/updated conversations and a bounded
+unknown-freshness bootstrap, and generates a pending queue in `.state/`.
 3. **Capture** — `project_batch_export.js` retrieves queued conversations
    sequentially in the browser and downloads temporary `AFCHAT_*.json` packages
 containing both raw conversation data and rendered Markdown.
 4. **Archive** — `capture_watch.rb` monitors the browser's download directory,
-   validates capture identities, and atomically saves completed exports into
+   validates identities/provenance/hashes, and installs complete version bundles into
 the separate data repository.
 5. **Resume** — Rerunning reconciliation removes successfully archived
-   conversation IDs from the pending queue. Interrupted or incomplete exports
+   unchanged verified conversations from the pending queue. Interrupted or incomplete exports
 remain eligible for subsequent attempts.
 
 Daily discovery depends on the undocumented endpoint's ordering and visibility.
-Existing captures are reused; updated inventory metadata does not recapture
-changed content. See the [inventory contract](AUTOMATED_EXPORT.md#inventory-contract-for-downstream-consumers-ect-02)
-for coverage, timestamps, lineage and audit recovery guarantees.
+Verified unchanged captures are reused; listing changes trigger content inspection,
+with identical raw content deduplicated. Legacy files stay untouched and explicitly
+unknown until captured through a ten-ID bootstrap lane. See the
+[update/version contract](AUTOMATED_EXPORT.md#daily-update-selection-and-unknown-freshness)
+for coverage, digest scope, races, bounded recovery and current/older-version lookup.
 
 ### Repository Components
 
@@ -71,7 +73,8 @@ repository into a separate private git repository.)
 
 **Raw conversation JSON**
 
-`raw/<conversation-id>.json`
+New captures: `versions/<full-conversation-id>/<raw-content-digest>/raw.json`.
+Existing `raw/<conversation-id>.json` files remain readable and unchanged.
 
 Preserves the retrieved conversation response, including available message
 structure, metadata, and branching information. This is the canonical archival
@@ -79,11 +82,20 @@ representation for future processing.
 
 **Readable Markdown**
 
-`YYYY-MM-DD - <title> [<id-prefix>].md`
+New captures: `versions/<full-conversation-id>/<digest>/conversation.md`.
+Existing `YYYY-MM-DD - <title> [<id-prefix>].md` files remain in place.
 
 Contains visible user/assistant messages from the active conversation branch,
 formatted for human reading, search, and LLM consumption. This is a derived
 view rather than a complete representation of the raw conversation.
+
+Each version has checked metadata; immutable observation receipts preserve capture
+and inventory provenance, including deduplicated repeats and metadata-only changes.
+`versions/<full-id>/current.json` selects the latest complete capture observation,
+which may still have unresolved freshness. Source update times do not order versions.
+Verify lookup with `SnapshotArchive#current!`/`version!`; restore an older reading by
+copying a verified bundle to a fresh directory, preserving all archived files. See
+[storage and restoration](AUTOMATED_EXPORT.md#version-storage-digest-and-current-lookup).
 
 **Inventory and checkpoints**
 
@@ -230,6 +242,7 @@ Offline inventory regression tests use Node.js 18 or later:
 ```bash
 node --test test/project_inventory.test.js
 ruby -I. test/reconcile_exports_test.rb
+ruby -I. test/snapshot_archive_test.rb
 ruby -I. test/import_codex_sessions_test.rb
 ```
 
@@ -262,7 +275,7 @@ and instructions for keeping projects separate.
     - Your archive directory (default: `/Users/davidnorris/code/export-chats-data`).
 
 4. Generate the current pending queue and browser exporter.
-    - (This regenerates the next inventory console script and batch exporter. Pending IDs: 0 means no known uncaptured IDs; it does not establish unseen-record discovery or capture changed content.)
+    - (This regenerates the next inventory console script and batch exporter. Review freshness states: Pending IDs: 0 can coexist with unknown/deferred IDs and does not establish unseen-record discovery.)
     - `cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb`
 
 5. Start the capture watcher in a separate terminal.
@@ -278,6 +291,6 @@ and instructions for keeping projects separate.
 
 8. Verify the archive.
     - `cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb`
-    - (Confirm **Pending IDs: 0** for cumulative known IDs. Partial discovery has conditional coverage; full audits recover visible records outside overlap. Existing captures do not prove changed content was archived.)
+    - (Review pending, unknown/deferred and per-ID freshness states. Partial discovery has conditional coverage; full audits recover visible records outside overlap. Current content can remain unresolved after a race or unusable source timestamp.)
     - (If IDs remain, investigate the watcher and browser output before retrying. Start a fresh watcher before running the regenerated exporter.)
     - (When finished, stop caffeinate with Ctrl-C in its terminal.)

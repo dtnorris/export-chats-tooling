@@ -111,6 +111,8 @@ module ReconcileHelpers
   end
 end
 
+require_relative "snapshot_archive"
+
 # Match known inventory IDs to archival evidence and write resumable queues.
 # Accepts explicit archive/inventory paths; raises ReconcileError on unsafe evidence.
 class ExportReconciler
@@ -197,7 +199,21 @@ class ExportReconciler
 
     pending = records.reject { |record| completed_ids[record.fetch("id")] }
       .sort_by { |record| [record["create_time"].to_s, record.fetch("id")] }
-
+    freshness_states = []
+    legacy_evidence = completed
+    if inventory["schema"] == "adventurefinder-chat-project-inventory/v0.2"
+      archive = SnapshotArchive.new(root: data_repo, project_id: project_id, account_id: inventory["account_id"])
+      pending, freshness_states = archive.select(records.sort_by { |record| record.fetch("id") }, completed_ids.keys)
+      completed_ids = freshness_states.select { |entry| entry["state"] == "verified-unchanged" }.to_h { |entry| [entry["id"], true] }
+      completed = freshness_states.select { |entry| entry["state"] == "verified-unchanged" }
+    else
+      completed_ids = {}
+      completed = []
+      pending = records.sort_by { |record| [record["create_time"].to_s, record.fetch("id")] }
+      freshness_states = records.map do |record|
+        { "id" => record["id"], "state" => "unknown-legacy-inventory", "selected" => false, "current" => nil }
+      end
+    end
     report = {
       "schema" => RECONCILIATION_SCHEMA,
       "generated_at" => Time.now.utc.iso8601,
@@ -213,6 +229,9 @@ class ExportReconciler
       "completed_conversation_count" => completed_ids.length,
       "pending_conversation_count" => pending.length,
       "completed" => completed,
+      "legacy_evidence" => legacy_evidence,
+      "freshness" => freshness_states,
+      "unknown_or_unresolved_count" => freshness_states.count { |entry| entry["state"] != "verified-unchanged" && !entry["selected"] },
       "unresolved_markdown_payloads" => unresolved.map { |payload| unresolved_report(payload, title_index) }
     }
 
@@ -238,6 +257,17 @@ class ExportReconciler
       end
     }
 
+    if inventory["schema"] == "adventurefinder-chat-project-inventory/v0.2"
+      queue["schema"] = SnapshotArchive::QUEUE_SCHEMA
+      queue["account_id"] = inventory.fetch("account_id")
+      queue["source"] = inventory.slice("schema", "producer", "checkpoint_sha256", "scan_started_at", "generated_at", "coverage", "full_audit")
+        .merge("inventory_sha256" => report.fetch("inventory_sha256"))
+      queue["pending"] = pending
+      queue = SnapshotArchive.seal(queue)
+      SnapshotArchive.queue!(queue)
+    end
+
+    validate_state_paths!
     FileUtils.mkdir_p(STATE_DIR)
     ReconcileHelpers.atomic_json(File.join(STATE_DIR, "reconciliation.json"), report)
     ReconcileHelpers.atomic_json(File.join(STATE_DIR, "completed_ids.json"), {
@@ -255,6 +285,20 @@ class ExportReconciler
   end
 
   private
+
+  # Refuse state symlinks before writing generated queues/checkpoints/runners.
+  # Fixed filenames stay within STATE_DIR; returns nil or raises ReconcileError.
+  def validate_state_paths!
+    %w[reconciliation.json completed_ids.json pending_ids.json project_batch_console.js project_inventory_console.js].each do |name|
+      current = File.join(STATE_DIR, name)
+      loop do
+        raise ReconcileError, "state symlink refused" if File.symlink?(current)
+        break if current == "/"
+        current = File.dirname(current)
+      end
+    end
+    nil
+  end
 
   def write_console_runner(queue)
     runner_path = File.expand_path("project_batch_export.js", __dir__)
@@ -305,6 +349,9 @@ class ExportReconciler
       raise ReconcileError, "inventory contains duplicate conversation IDs" if seen[id]
       seen[id] = true
       record = item.slice("id", "title")
+      if schema == "adventurefinder-chat-project-inventory/v0.2"
+        record.merge!(item.slice("create_time_status", "update_time_status", "observed_in_scan", "last_observed_at", "last_full_audit_at"))
+      end
       %w[create_time update_time].each do |field|
         normalized = ReconcileHelpers.inventory_timestamp(item[field])
         record[field] = normalized[:value]
@@ -495,6 +542,8 @@ class ExportReconciler
     }
   end
 
+  # Return legacy raw identity evidence for known IDs; never proves freshness or
+  # complete ingestion. Raises on malformed JSON or conflicting embedded IDs.
   def raw_capture_ids(inventory_by_id)
     raw_dir = File.join(data_repo, "raw")
     return [] unless Dir.exist?(raw_dir)
@@ -509,9 +558,9 @@ class ExportReconciler
         raise ReconcileError, "invalid raw JSON capture: #{path}"
       end
 
-      embedded_id = raw["id"] || raw["conversation_id"]
-      if embedded_id && embedded_id != id
-        raise ReconcileError, "raw capture ID mismatch in #{path}: #{embedded_id.inspect} != #{id.inspect}"
+      raise ReconcileError, "raw capture must be an object: #{path}" unless raw.is_a?(Hash)
+      %w[id conversation_id].each do |field|
+        raise ReconcileError, "raw capture ID mismatch in #{path}" if raw.key?(field) && raw[field] != id
       end
 
       id
@@ -538,6 +587,8 @@ class ExportReconciler
     puts "Existing payloads: #{report.fetch("unique_markdown_payload_count")} unique Markdown payloads"
     puts "Completed IDs:     #{report.fetch("completed_conversation_count")}"
     puts "Pending IDs:       #{report.fetch("pending_conversation_count")}"
+    puts "Unknown/deferred:  #{report.fetch("unknown_or_unresolved_count", 0)} (inspect freshness states; zero pending need not mean current)"
+    puts "Legacy inventory cannot authorize capture; establish a matching ECT-01 v0.2 inventory." if report["inventory_coverage"] == "legacy-unverified"
     puts "Counts cover known IDs only; completion does not establish discovery or content freshness."
     puts "Unresolved files:  #{report.fetch("unresolved_markdown_payloads").length} payloads"
     puts
@@ -556,7 +607,7 @@ if $PROGRAM_NAME == __FILE__
 
   begin
     ExportReconciler.new(data_repo: data_repo, inventory_path: inventory_path).run
-  rescue ReconcileError, Errno::ENOENT, JSON::ParserError => e
+  rescue ReconcileError, SnapshotArchiveError, Errno::ENOENT, JSON::ParserError => e
     warn "RECONCILIATION FAILED: #{e.message}"
     exit 1
   end

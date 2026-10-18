@@ -6,8 +6,11 @@ ChatGPT's page Content-Security-Policy blocks page JavaScript from connecting to
 
 New captures are written as:
 
-- `raw/<conversation-id>.json` — canonical source response;
-- `YYYY-MM-DD - <title> [<id-prefix>].md` — readable active-branch Markdown.
+- `versions/<full-id>/<content-digest>/raw.json` — authoritative source response;
+- `versions/<full-id>/<content-digest>/conversation.md` — derived active-branch Markdown;
+- checked version metadata, immutable observations and a derived current index.
+
+Earlier raw and Markdown files stay byte-for-byte unchanged at their original paths.
 
 Runtime/checkpoint files live under `export-chats-tooling/.state/` and are ignored by Git.
 
@@ -91,8 +94,8 @@ A matched count does not prove server completeness or archived content.
 ### Inventory contract for downstream consumers (ECT-02)
 
 This section defines the binding v0.2 inventory/timestamp contract. Legacy v0.1
-JSON remains readable for reconciliation. No versioned capture, changed-content
-recapture, deletion, movement, or archival migration is implemented here.
+JSON remains readable for historical reconciliation. ECT-02 consumes this contract
+for update selection and versioned capture below; it does not change pagination.
 
 - **schema** is adventurefinder-chat-project-inventory/v0.2; **producer** is
   project_inventory.js/ECT-01. **project_id** and non-secret **account_id** bind
@@ -204,6 +207,143 @@ and existing capture evidence; zero pending does not mean unseen chats or
 changes to already archived content were captured. ECT-02 must not interpret
 inventory timestamps as content versions or archival freshness.
 
+### Daily update selection and unknown freshness
+
+New captures require a validated ECT-01 v0.2 inventory with project/account binding.
+Legacy inventory files remain readable for historical matching, but cannot authorize
+capture: first establish an exhaustive v0.2 baseline. Reconciliation generates a
+checksummed v0.2 queue with the inventory checksum, exact inventory-file SHA-256,
+scan/audit provenance and each selected cumulative listing record.
+
+`reconciliation.json` separates `legacy_evidence` from verified `completed` and
+per-ID `freshness` states. An old creation date does not suppress a recent update.
+`new` identifies IDs without historical matching or a verified snapshot. `updated`
+means the latest listing differs from captured evidence or freshness is unresolved.
+`verified-unchanged` skips capture when the latest complete observation agreed with
+the fetched update time and the current listing still has that same valid time.
+This assumes the provider changes update time when content changes; equal-time
+provider changes cannot be discovered from timestamps alone.
+
+Legacy Markdown matches, raw-only files and old `.state` completion entries have
+**unknown freshness**, irrespective of filename, date or modification time. They
+are never promoted into version metadata or assigned invented capture dates.
+At most **ten** unknown/bootstrap/recovery IDs are selected per reconciliation,
+in full-ID lexical order. Further IDs remain explicitly deferred; rerun after
+draining the selected queue to progress through a large legacy archive. This is
+an operator-driven bootstrap, not a daily full-history capture. Genuinely new IDs
+and first inspections of changed verified IDs do not use this ten-ID budget.
+
+A valid but disagreeing listing/fetch pair gets at most **two distinct captured
+attempts per exact listing observation**. Exact download replay consumes no extra
+attempt. Afterward it remains `unresolved-wait-inventory`; a later observed listing
+allows another bounded attempt. Missing/invalid source update times remain
+unresolved and use `unknown-wait-audit` after a capture, with at most ten selected
+on a later full audit (`unknown-audit`). There is no per-day refetch of every old
+chat. Zero pending may coexist with unknown/deferred IDs: inspect the report.
+An absent ID in a partial listing never removes any archived file or observation.
+
+### Version storage, digest and current lookup
+
+ECT-02 leaves every existing `raw/<id>.json` and root Markdown file in place and
+byte-for-byte unchanged. New authoritative captures are additive:
+
+```text
+versions/binding.json                         # one project/account per archive
+versions/<full-id>/<version>/raw.json          # exact first response UTF-8 JSON
+versions/<full-id>/<version>/conversation.md   # derived active-branch reading
+versions/<full-id>/<version>/version.json      # identity, renderer, file hashes
+versions/<full-id>/observations/<package-sha256>.json
+versions/<full-id>/current.json                # derived, verified observation
+```
+
+`version` is SHA-256 of the **entire parsed raw JSON**, using ECT-01's typed
+encoding with recursively sorted object keys. Arrays retain order, numbers use
+binary64 semantics, and no volatile metadata fields are excluded. Source fields,
+inactive branches, mapping and provider metadata survive. Duplicate object keys,
+nonfinite numbers and integers outside ±(2^53−1) are rejected to avoid ambiguous
+equality. Whitespace, object-key ordering and equivalent numeric serialization
+do not create versions; the first raw response's exact bytes remain authoritative.
+Every bundle additionally hashes its exact raw/Markdown bytes. Same raw content
+with different Markdown under `active-branch/v1` is a conflict, not an overwrite.
+
+A changed provider metadata field creates a version even if readable messages
+stay the same. An advanced **listing** time with identical fetched raw creates no
+duplicate bundle: a separate immutable observation records the attempt, listing,
+inventory hashes/provenance, request/capture times, fetched update value/status,
+raw/Markdown hashes and freshness. Serialization-only repeats record the newly
+observed wire hash; they retain the first raw serialization rather than another
+raw copy. Metadata checksums detect corruption, not malicious re-signing. Only
+unedited local inventory/queue/browser packages are trusted producer evidence.
+
+Canonical/current means the last complete **capture observation**, ordered by
+`request_started_at`, then `captured_at`, then full version digest, then package
+SHA-256 (all ascending). Source update times do not order versions: they can be
+equal, move backwards or disagree. An out-of-order download cannot rewind current;
+a later capture of restored old content points back to its existing bundle.
+Local clock accuracy is required for capture ordering; no server revision ID or
+atomic server snapshot is claimed. A current bundle may have unresolved freshness.
+
+For verified lookup, use the Ruby API after replacing example paths/identities:
+
+```ruby
+require_relative "reconcile_exports"
+archive = SnapshotArchive.new(root: "/path/to/archive",
+  project_id: "g-p-example", account_id: "account-example")
+current = archive.current!("full-conversation-id")
+history = archive.observations("full-conversation-id")
+metadata = archive.version!("full-conversation-id", "64-character-version-digest")
+```
+
+`current!` returns nil for an interrupted missing/stale index and raises for
+corruption; `version!` verifies all three bundle files and raises on missing or
+different bytes. To restore an older reading **without changing history**, verify
+its version, create a fresh destination directory with `Dir.mkdir` (fails if it
+already exists), then copy that bundle's three files there. Do not overwrite
+legacy paths or edit `current.json`. Copying an older reading does not change
+archival freshness or restore messages into ChatGPT; a subsequent real capture
+records any provider-side restoration as a new observation.
+
+### Capture races and interruption recovery
+
+The browser binds its current selected account to the queue before fetching,
+validates full embedded IDs, renders conservatively and downloads exact raw bytes
+with SHA-256 hashes. The watcher validates queue/capture schema, binding, IDs,
+hashes, timestamps and full mapping before archive writes. Invalid metadata times
+are rejected; missing/invalid **source** times are retained as unresolved evidence.
+Conflicting IDs, duplicate keys, malformed mappings, cycles, path traversal and
+existing symlink components are refused. Packages do not supply destination paths.
+One local writer per tooling/archive pair is required; hostile concurrent filesystem
+mutation is outside the path checks' guarantee.
+
+`verified-as-listed` requires valid equal listing/fetched update times, no source
+update later than request start, and listing observation before request start.
+Other captures retain exactly what was fetched with `unresolved` freshness.
+An update racing ahead of the listing, a lagging fetch, or contradictory timestamps
+cannot advance freshness. Equal timestamps cannot prove no update happened after
+the response or that the provider exposed a consistent snapshot; later inventory
+and ECT-01 audits remain necessary. No atomic server or power-loss claim is made.
+
+Ingestion stages raw, Markdown and version metadata under `versions/.incoming/`,
+fsyncs individual writes and renames the complete directory into place. Only then
+does it install the immutable observation, derived current index and local
+`.state/capture_status.json` checkpoint. Files and rename parents are fsynced;
+physical media/controller durability across power failure has not been measured.
+The checkpoint is a derived cache: raw-only files, download clicks and stale old
+status entries cannot establish completion. `ingested` means a complete verified
+bundle/index; `completed` additionally requires agreement with the queued listing.
+
+Keep rejected/incomplete downloads and the matching queue/script. Stop the browser,
+restart the watcher with that queue, and replay the retained download: identical
+staged writes are accepted, missing steps repaired, and no duplicate bundle or
+observation is created. Complete observations repair missing/stale valid indexes
+and checkpoints on watcher restart. Missing/altered immutable bundle or observation
+metadata, invented indexes, and different existing staged bytes fail closed;
+inspect the reported paths and recover original evidence rather than editing
+hashes or deleting historical versions. Do not regenerate away the matching queue
+before draining downloads; queue mismatch is rejected with the download retained.
+Partial/unreferenced bundles do not count as complete. Unreferenced staging files
+can be retained for investigation; the watcher does not silently delete them.
+
 ## 1. Reconcile the existing archive
 
 From your `export-chats-tooling` checkout:
@@ -226,7 +366,10 @@ directory, always supply the exact JSON path; default discovery does not select
 a project for you. The existing `.state/` checkpoints support one project at a
 time, so use separate tooling checkouts when archiving several projects.
 
-Review `.state/reconciliation.json`. The matcher is deliberately conservative: unique normalized titles are accepted, duplicate titles require a matching creation date, and unmatched/ambiguous historical files remain pending. A false negative causes a harmless re-fetch; an uncertain match never suppresses a conversation ID.
+Review `.state/reconciliation.json`. Historical matching uses unique normalized
+titles or creation dates for duplicate titles, and records its evidence separately.
+Such matches remain unknown until bootstrapped; only verified version observations
+can skip capture on freshness grounds.
 
 Reconciliation also generates .state/project_inventory_console.js for the next
 discovery run and .state/project_batch_console.js, which embeds the exact pending queue into the checked-in browser runner. This avoids all cross-origin localhost requests.
@@ -241,9 +384,9 @@ By default it watches `~/Downloads` for completed `AFCHAT_*.json` files. Set `CH
 
 For every valid package the watcher:
 
-1. verifies project and conversation identity against the reconciled queue;
-2. writes raw JSON and Markdown atomically into `export-chats-data`;
-3. updates `.state/capture_status.json`;
+1. verifies project/account, inventory, full conversation identity and hashes;
+2. installs a complete raw/Markdown/metadata version and capture observation;
+3. verifies current lookup and updates `.state/capture_status.json`;
 4. deletes the temporary download package only after successful ingestion.
 
 Stopping it with `Ctrl-C` is safe.
@@ -264,7 +407,11 @@ window.__chatProjectBatchLimit = 2;
 
 Then paste the clipboard contents and run it. Firefox may ask whether `chatgpt.com` may download multiple files; allow that before a long run.
 
-Confirm the watcher reports two captured conversations and that `export-chats-data` has the new `raw/<id>.json` plus ID-suffixed Markdown file.
+Confirm the watcher reports successful ingestion and the archive has complete
+`versions/<full-id>/<digest>/` bundles, observations and verified current indexes.
+Unresolved freshness still needs the bounded recovery described above. A future
+live smoke test requires separate operator authorization; automated tests use
+synthetic responses and have not established live API behavior.
 
 ## 4. Run the remaining queue
 
@@ -293,6 +440,8 @@ The browser does not claim a conversation is durably complete merely because it 
 
 ## 5. Inspect before committing data
 
-After a run, inspect both repositories normally. The tooling repository should have only ignored `.state/` changes; the data repository should contain newly captured Markdown files and `raw/*.json` files.
+After a run, inspect both repositories normally. The tooling repository should
+have only ignored `.state/` changes; the data repository should contain additive
+`versions/` evidence. Earlier raw/Markdown files must remain unchanged.
 
 If you continue adding manual exports while the batch system is stopped, rerun `ruby reconcile_exports.rb` before restarting so the pending queue incorporates those files.

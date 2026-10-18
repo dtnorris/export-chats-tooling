@@ -71,6 +71,8 @@
 
   let sessionContext = null;
 
+  /** Read the browser session and bind its account to this queue. Returns the
+   * token context in memory only; throws on HTTP/identity failures. */
   async function refreshSession() {
     const response = await fetch("/api/auth/session", {
       credentials: "include",
@@ -85,7 +87,9 @@
     if (!accessToken) fail("ChatGPT session response contained no access token.");
 
     const accountId = accountIdFromSession(session, accessToken);
-    if (!accountId) fail("Could not determine ChatGPT account ID.");
+    if (typeof accountId !== "string" || accountId !== queue.account_id) {
+      fail("ChatGPT session account does not match the trusted inventory queue.");
+    }
 
     const claims = decodeJwtPayload(accessToken);
     sessionContext = {
@@ -247,26 +251,10 @@
     return { markdown, messageCount: exported.length };
   }
 
-  function conversationCreateDate(conversation, queueEntry) {
-    const values = [conversation?.create_time, queueEntry?.create_time];
-    for (const value of values) {
-      if (typeof value === "number" && Number.isFinite(value)) {
-        const date = new Date(value * 1000);
-        if (!Number.isNaN(date.getTime())) return localDate(date);
-      }
-      if (typeof value === "string" && value) {
-        const date = new Date(value);
-        if (!Number.isNaN(date.getTime())) return localDate(date);
-      }
-    }
-    return localDate(new Date());
-  }
-
-  function localDate(date) {
-    const y = String(date.getFullYear()).padStart(4, "0");
-    const m = String(date.getMonth() + 1).padStart(2, "0");
-    const d = String(date.getDate()).padStart(2, "0");
-    return `${y}-${m}-${d}`;
+  /** Hash exact UTF-8 raw/Markdown bytes; resolves SHA-256 or throws crypto errors. */
+  async function sha256(text) {
+    const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, "0")).join("");
   }
 
   function baseDelay() {
@@ -299,7 +287,8 @@
   }
 
   const queue = window.__adventureFinderBatchQueue;
-  if (!queue || !Array.isArray(queue.pending)) {
+  if (!queue || queue.schema !== "adventurefinder-chat-pending-queue/v0.2" ||
+      typeof queue.account_id !== "string" || !/^[0-9a-f]{64}$/.test(queue.sha256) || !Array.isArray(queue.pending)) {
     fail(
       "No embedded batch queue was found. Run ruby reconcile_exports.rb, then paste .state/project_batch_console.js into this console."
     );
@@ -358,7 +347,9 @@
       console.log(logPrefix, `[${index + 1}/${runLimit}] ${entry.title || "(untitled)"} ${entry.id}`);
 
       let response;
+      let requestStartedAt;
       while (true) {
+        requestStartedAt = new Date().toISOString();
         response = await fetchConversation(entry.id, projectId);
         if (response.status !== 429) break;
 
@@ -381,9 +372,14 @@
         });
       }
 
-      const conversation = await response.json();
+      const rawText = await response.text();
+      const conversation = JSON.parse(rawText);
       let rendered;
       try {
+        if ((!Object.hasOwn(conversation, "id") && !Object.hasOwn(conversation, "conversation_id")) ||
+            ["id", "conversation_id"].some(field => Object.hasOwn(conversation, field) && conversation[field] !== entry.id)) {
+          throw new Error("Fetched conversation identity conflicts with the queue.");
+        }
         rendered = renderConversation(conversation);
       } catch (error) {
         console.error(logPrefix, `Validation failed for ${entry.id}; leaving it pending and continuing.`, error);
@@ -393,15 +389,20 @@
       }
 
       downloadCapture({
-        schema: "adventurefinder-chat-download-capture/v0.1",
+        schema: "adventurefinder-chat-download-capture/v0.2",
         project_id: projectId,
+        account_id: sessionContext.accountId,
+        queue_sha256: queue.sha256,
+        entry,
         conversation_id: entry.id,
-        title: conversation.title || entry.title || "Chat Export",
-        create_date: conversationCreateDate(conversation, entry),
+        renderer: "active-branch/v1",
         message_count: rendered.messageCount,
+        request_started_at: requestStartedAt,
         captured_at: new Date().toISOString(),
         markdown: rendered.markdown,
-        raw: conversation
+        markdown_sha256: await sha256(rendered.markdown),
+        raw_json: rawText,
+        raw_sha256: await sha256(rawText)
       });
 
       window.__chatProjectBatchState.downloadsTriggeredThisRun++;
