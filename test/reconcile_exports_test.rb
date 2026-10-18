@@ -87,10 +87,12 @@ class ReconcileExportsTest < Minitest::Test
     assert_equal 3, report["inventory_count"]
     assert_equal 1, report["observed_conversation_count"]
     assert_equal "incremental", report["inventory_coverage"]
-    assert_equal 1, report["completed_conversation_count"]
-    assert_equal 2, report["pending_conversation_count"]
+    assert_equal 0, report["completed_conversation_count"]
+    assert_equal 3, report["pending_conversation_count"]
+    assert_equal ["old-completed"], report["legacy_evidence"].map { |entry| entry["id"] }
+    assert_equal "unknown-legacy", report["freshness"].find { |entry| entry["id"] == "old-completed" }["state"]
     queue = state("pending_ids.json")
-    assert_equal %w[current old-pending], queue["pending"].map { |record| record["id"] }.sort
+    assert_equal %w[current old-completed old-pending], queue["pending"].map { |record| record["id"] }.sort
     assert_equal 3, queue["inventory_count"]
     assert_equal 1, queue["observed_conversation_count"]
     assert_includes File.binread(File.join(@state, "project_inventory_console.js")), "window.__chatProjectInventoryPrevious = "
@@ -151,8 +153,11 @@ class ReconcileExportsTest < Minitest::Test
     }
     File.binwrite(File.join(@data, "2026-01-02 - Same title.md"), "A unique synthetic Markdown payload")
     report = reconcile(inventory)
-    assert_equal ["iso"], report["completed"].map { |record| record["id"] }
-    assert_equal ["seconds"], state("pending_ids.json")["pending"].map { |record| record["id"] }
+    assert_equal ["iso"], report["legacy_evidence"].map { |record| record["id"] }
+    assert_empty report["completed"]
+    assert_equal 0, report["completed_conversation_count"]
+    assert_equal %w[iso seconds], state("pending_ids.json")["pending"].map { |record| record["id"] }.sort
+    assert report["freshness"].all? { |entry| entry["state"] == "unknown-legacy-inventory" && !entry["selected"] }
     assert_includes File.binread(File.join(@state, "project_inventory_console.js")), "window.__chatProjectInventoryPrevious = null;"
   end
 
@@ -206,7 +211,7 @@ class ReconcileExportsTest < Minitest::Test
   def test_cli_runs_in_disposable_tooling_root_and_preserves_archive_bytes
     tooling = File.join(@root, "tooling")
     FileUtils.mkdir_p(tooling)
-    %w[reconcile_exports.rb project_batch_export.js project_inventory.js].each do |name|
+    %w[reconcile_exports.rb snapshot_archive.rb project_batch_export.js project_inventory.js].each do |name|
       FileUtils.cp(File.expand_path("../#{name}", __dir__), tooling)
     end
     path = File.join(@data, "Synthetic Project Inventory.json")

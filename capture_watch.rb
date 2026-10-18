@@ -1,61 +1,56 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-require "digest"
-require "fileutils"
-require "json"
-require "pathname"
-require "time"
+require_relative "reconcile_exports"
 
 class CaptureWatchError < StandardError; end
 
-STATE_DIR = File.expand_path(".state", __dir__)
-DEFAULT_DATA_REPO = File.expand_path("../export-chats-data", __dir__)
 DEFAULT_DOWNLOAD_DIR = File.expand_path(ENV.fetch("CHAT_EXPORT_DOWNLOAD_DIR", "~/Downloads"))
 CAPTURE_GLOB = "AFCHAT_*.json"
-CAPTURE_SCHEMA = "adventurefinder-chat-download-capture/v0.1"
 POLL_SECONDS = 1.0
 
+# Ingest complete browser packages with a matching trusted queue. Downloads remain
+# recoverable until bundle, observation, current index and local checkpoint verify.
+# Single watcher per tooling checkout; errors leave packages in place.
 class CaptureWatch
-  def initialize(data_repo:, download_dir:, once: false)
+  # Read explicit archive/download/state paths and an optional one-pass flag.
+  # Raises on invalid queue/binding or filesystem errors; never trusts old status.
+  def initialize(data_repo:, download_dir:, once: false, state_dir: STATE_DIR, fault: nil)
     @data_repo = File.expand_path(data_repo)
     @download_dir = File.expand_path(download_dir)
+    @state_dir = File.expand_path(state_dir)
     @once = once
-    @queue_path = File.join(STATE_DIR, "pending_ids.json")
-    @status_path = File.join(STATE_DIR, "capture_status.json")
+    @fault = fault
     @stable = {}
-
-    raise CaptureWatchError, "data repo does not exist: #{@data_repo}" unless Dir.exist?(@data_repo)
-    raise CaptureWatchError, "download directory does not exist: #{@download_dir}" unless Dir.exist?(@download_dir)
-    raise CaptureWatchError, "pending queue missing; run reconcile_exports.rb first" unless File.file?(@queue_path)
-
-    @queue = JSON.parse(File.binread(@queue_path))
-    @project_id = @queue.fetch("project_id")
-    @queue_by_id = @queue.fetch("pending").to_h { |entry| [entry.fetch("id"), entry] }
-    @status = load_status
-    reconcile_existing_raw!
+    raise CaptureWatchError, "download directory does not exist" unless Dir.exist?(@download_dir)
+    current = @download_dir
+    loop do
+      raise CaptureWatchError, "download directory symlink refused" if File.symlink?(current)
+      break if current == "/"
+      current = File.dirname(current)
+    end
+    @queue = SnapshotArchive.queue!(SnapshotArchive.parse(File.binread(state_path!("pending_ids.json"))))
+    @archive = SnapshotArchive.new(root: @data_repo, project_id: @queue["project_id"], account_id: @queue["account_id"])
+    @status = { "schema" => "adventurefinder-chat-capture-status/v0.3", "project_id" => @queue["project_id"],
+      "account_id" => @queue["account_id"], "queue_sha256" => @queue["sha256"], "completed" => {}, "ingested" => {} }
+    # Old completion entries and raw-only files never authorize success. Complete
+    # journal entries can repair an interrupted derived index/checkpoint.
+    @queue["pending"].each do |entry|
+      current = @archive.current!(entry["id"], repair: true)
+      record_status(entry["id"], current) if current
+    end
     persist_status!
   end
 
+  # Poll stable downloads sequentially, or scan twice for --once. Returns nil;
+  # Ctrl-C leaves filesystem operations replayable through retained downloads.
   def run
-    puts "AdventureFinder capture download watcher"
-    puts "Downloads: #{@download_dir}"
-    puts "Data repo: #{@data_repo}"
-    puts "Project:   #{@project_id}"
-    puts "Queued:    #{@queue_by_id.length}"
-    puts "Completed: #{@status.fetch("completed").length}"
-    puts
-
-    if @once
-      scan_once
-      sleep 0.05
-      scan_once
-      return
-    end
-
+    puts "Capture watcher: #{@queue["project_id"]}; #{@queue["pending"].length} queued; downloads #{@download_dir}"
     loop do
       scan_once
-      sleep POLL_SECONDS
+      break if @once && @scanned
+      @scanned = true
+      sleep(@once ? 0.05 : POLL_SECONDS)
     end
   rescue Interrupt
     puts "\nCapture watcher stopped."
@@ -63,188 +58,95 @@ class CaptureWatch
 
   private
 
+  # Inspect sizes on consecutive polls; process only stable regular downloads.
+  # Rejections/errors remain on disk, with no completion acknowledgement.
   def scan_once
     paths = Dir.glob(File.join(@download_dir, CAPTURE_GLOB)).sort
-    live = paths.to_h { |path| [path, true] }
-    @stable.delete_if { |path, _| !live.key?(path) }
-
+    @stable.delete_if { |path, _| !paths.include?(path) }
     paths.each do |path|
+      raise CaptureWatchError, "symlink/non-file download refused" if File.symlink?(path) || !File.file?(path)
       size = File.size(path)
       prior = @stable[path]
-      if prior && prior.fetch(:size) == size
-        prior[:stable_scans] += 1
-      else
-        @stable[path] = { size: size, stable_scans: 0 }
-      end
-
-      next unless @stable.fetch(path).fetch(:stable_scans) >= 1
-
+      @stable[path] = size
+      next unless prior == size
       process_capture!(path)
       @stable.delete(path)
-    rescue JSON::ParserError => e
-      warn "capture watcher: invalid JSON left in place: #{path}: #{e.message}"
-      @stable.delete(path)
-    rescue CaptureWatchError => e
-      warn "capture watcher: rejected capture left in place: #{path}: #{e.message}"
+    rescue SnapshotArchiveError, CaptureWatchError, JSON::ParserError, SystemCallError, KeyError, TypeError => error
+      warn "capture watcher: rejected/incomplete download left in place: #{path}: #{error.message}"
       @stable.delete(path)
     end
   end
 
+  # Ingest one package, verify current and checkpoint, then remove it. Returns its
+  # current observation; exceptions (including injected faults) retain the download.
   def process_capture!(path)
-    payload = JSON.parse(File.binread(path))
-    raise CaptureWatchError, "schema mismatch" unless payload["schema"] == CAPTURE_SCHEMA
-    raise CaptureWatchError, "project mismatch" unless payload.fetch("project_id") == @project_id
-
-    id = payload.fetch("conversation_id")
-    queued = @queue_by_id[id]
-    raise CaptureWatchError, "conversation is not in the reconciled pending queue: #{id}" unless queued
-
-    raw = payload.fetch("raw")
-    markdown = payload.fetch("markdown")
-    message_count = payload.fetch("message_count")
-    title = payload["title"] || queued["title"] || "Chat Export"
-    date = normalize_date(payload["create_date"])
-
-    raise CaptureWatchError, "raw conversation must be an object" unless raw.is_a?(Hash)
-    raise CaptureWatchError, "markdown must be a non-empty string" unless markdown.is_a?(String) && !markdown.empty?
-    raise CaptureWatchError, "message_count must be a positive integer" unless message_count.is_a?(Integer) && message_count.positive?
-
-    embedded_id = raw["id"] || raw["conversation_id"]
-    if embedded_id && embedded_id != id
-      raise CaptureWatchError, "raw conversation ID #{embedded_id.inspect} does not match queued ID #{id.inspect}"
-    end
-
-    raw_path = File.join(@data_repo, "raw", "#{id}.json")
-    md_name = "#{date} - #{safe_filename_part(title)} [#{id[0, 8]}].md"
-    md_path = File.join(@data_repo, md_name)
-
-    raw_text = JSON.pretty_generate(raw) + "\n"
-    markdown_text = markdown.end_with?("\n") ? markdown : "#{markdown}\n"
-    write_idempotent!(raw_path, raw_text)
-    write_idempotent!(md_path, markdown_text)
-
-    @status.fetch("completed")[id] = {
-      "captured_at" => payload["captured_at"] || Time.now.utc.iso8601,
-      "ingested_at" => Time.now.utc.iso8601,
-      "title" => title,
-      "message_count" => message_count,
-      "raw_path" => relative_to_data_repo(raw_path),
-      "markdown_path" => relative_to_data_repo(md_path),
-      "raw_sha256" => Digest::SHA256.hexdigest(raw_text),
-      "markdown_sha256" => Digest::SHA256.hexdigest(markdown_text)
-    }
-    @status.fetch("failures").delete(id)
+    raise CaptureWatchError, "unsafe download" if File.symlink?(path) || File.dirname(File.expand_path(path)) != @download_dir
+    text = File.binread(path)
+    @archive.ingest(text, @queue, fault: @fault)
+    id = JSON.parse(text).fetch("conversation_id")
+    current = @archive.current!(id)
+    raise CaptureWatchError, "complete current version required" unless current
+    record_status(id, current)
+    @fault&.call("before_checkpoint")
     persist_status!
-
+    @fault&.call("after_checkpoint")
+    verified = SnapshotArchive.verify!(JSON.parse(File.binread(state_path!("capture_status.json"))))
+    raise CaptureWatchError, "checkpoint verification failed" unless verified["ingested"][id] == current
     File.delete(path)
-    puts "Captured #{id} -> #{relative_to_data_repo(md_path)}"
+    puts "Ingested #{id} version #{current["version"]} (#{current["freshness"]})"
+    current
   end
 
-  def reconcile_existing_raw!
-    raw_dir = File.join(@data_repo, "raw")
-    return unless Dir.exist?(raw_dir)
-
-    Dir.glob(File.join(raw_dir, "*.json")).each do |path|
-      id = File.basename(path, ".json")
-      next unless @queue_by_id.key?(id)
-      next if @status.fetch("completed").key?(id)
-
-      raw = JSON.parse(File.binread(path))
-      embedded_id = raw["id"] || raw["conversation_id"]
-      if embedded_id && embedded_id != id
-        raise CaptureWatchError, "existing raw capture ID mismatch: #{path}"
-      end
-
-      @status.fetch("completed")[id] = {
-        "captured_at" => nil,
-        "ingested_at" => nil,
-        "title" => @queue_by_id.fetch(id)["title"],
-        "message_count" => nil,
-        "raw_path" => relative_to_data_repo(path),
-        "markdown_path" => nil,
-        "raw_sha256" => Digest::SHA256.file(path).hexdigest,
-        "markdown_sha256" => nil,
-        "recovered_from_disk" => true
-      }
+  # Record complete content separately from freshness; unresolved captures are
+  # ingested evidence, never marked complete against a listing.
+  def record_status(id, current)
+    @status["ingested"][id] = current
+    @status["completed"].delete(id)
+    entry = @queue["pending"].find { |candidate| candidate["id"] == id }
+    if current["freshness"] == "verified-as-listed" && entry.dig("listing", "update_time_status") == "valid" &&
+        entry.dig("listing", "update_time") == current.dig("listing", "update_time")
+      @status["completed"][id] = current
     end
   end
 
-  def load_status
-    if File.file?(@status_path)
-      parsed = JSON.parse(File.binread(@status_path))
-      if parsed["project_id"] != @project_id
-        raise CaptureWatchError, "capture_status.json belongs to a different project"
-      end
-      parsed["completed"] ||= {}
-      parsed["failures"] ||= {}
-      return parsed
+  # Resolve fixed state filenames and reject symlink components. Returns absolute
+  # path or raises before queue/checkpoint filesystem access.
+  def state_path!(name)
+    path = File.join(@state_dir, name)
+    current = path
+    loop do
+      raise CaptureWatchError, "state symlink refused" if File.symlink?(current)
+      break if current == "/"
+      current = File.dirname(current)
     end
-
-    {
-      "schema" => "adventurefinder-chat-capture-status/v0.2",
-      "project_id" => @project_id,
-      "created_at" => Time.now.utc.iso8601,
-      "updated_at" => Time.now.utc.iso8601,
-      "completed" => {},
-      "failures" => {}
-    }
+    path
   end
 
+  # Atomically fsync the derived checkpoint after full bundle verification.
+  # Errors propagate and leave the download for recovery.
   def persist_status!
-    @status["updated_at"] = Time.now.utc.iso8601
-    FileUtils.mkdir_p(STATE_DIR)
-    atomic_write(@status_path, JSON.pretty_generate(@status) + "\n")
-  end
-
-  def write_idempotent!(path, content)
-    if File.exist?(path)
-      existing = File.binread(path)
-      return if existing == content
-      raise CaptureWatchError, "refusing to overwrite different existing file: #{path}"
+    path = state_path!("capture_status.json")
+    FileUtils.mkdir_p(@state_dir)
+    temp = "#{path}.tmp-#{SecureRandom.hex(8)}"
+    File.open(temp, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+      file.write(JSON.pretty_generate(SnapshotArchive.seal(@status)) + "\n")
+      file.fsync
     end
-
-    FileUtils.mkdir_p(File.dirname(path))
-    atomic_write(path, content)
-  end
-
-  def atomic_write(path, content)
-    temp = "#{path}.tmp-#{Process.pid}"
-    File.binwrite(temp, content)
     File.rename(temp, path)
+    @archive.sync_directory(@state_dir)
   ensure
     File.delete(temp) if defined?(temp) && temp && File.exist?(temp)
-  end
-
-  def normalize_date(value)
-    return value if value.is_a?(String) && value.match?(/\A\d{4}-\d{2}-\d{2}\z/)
-    Time.now.getlocal.strftime("%Y-%m-%d")
-  end
-
-  def safe_filename_part(value)
-    result = value.to_s
-      .gsub(/[<>:\"\/\\|?*\u0000-\u001f]/, "-")
-      .gsub(/\s+/, " ")
-      .strip
-      .sub(/[. ]+\z/, "")
-      .slice(0, 160)
-    result.nil? || result.empty? ? "Chat Export" : result
-  end
-
-  def relative_to_data_repo(path)
-    Pathname.new(File.expand_path(path)).relative_path_from(Pathname.new(@data_repo)).to_s
   end
 end
 
 if $PROGRAM_NAME == __FILE__
   args = ARGV.dup
   once = args.delete("--once")
-  data_repo = args[0] || DEFAULT_DATA_REPO
-  download_dir = args[1] || DEFAULT_DOWNLOAD_DIR
-
   begin
-    CaptureWatch.new(data_repo: data_repo, download_dir: download_dir, once: !once.nil?).run
-  rescue CaptureWatchError, Errno::ENOENT, JSON::ParserError => e
-    warn "CAPTURE WATCH FAILED: #{e.message}"
+    CaptureWatch.new(data_repo: args[0] || DEFAULT_DATA_REPO,
+      download_dir: args[1] || DEFAULT_DOWNLOAD_DIR, once: !once.nil?).run
+  rescue CaptureWatchError, SnapshotArchiveError, SystemCallError, JSON::ParserError => error
+    warn "CAPTURE WATCH FAILED: #{error.message}"
     exit 1
   end
 end
