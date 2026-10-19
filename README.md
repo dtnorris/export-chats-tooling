@@ -243,6 +243,7 @@ Offline inventory regression tests use Node.js 18 or later:
 node --test test/project_inventory.test.js
 ruby -I. test/reconcile_exports_test.rb
 ruby -I. test/snapshot_archive_test.rb
+ruby -I. test/capture_watch_test.rb
 ruby -I. test/import_codex_sessions_test.rb
 ```
 
@@ -279,7 +280,7 @@ and instructions for keeping projects separate.
     - `cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb`
 
 5. Start the capture watcher in a separate terminal.
-    - (Leave it running while exporting. The watcher reads the pending queue only at startup, so start it after reconciliation. Restart an existing watcher before running a batch with a newly generated queue.)
+    - (Start it after reconciliation: it loads the queue only at startup. An initially empty queue reports completion and exits successfully without scanning Downloads. An initially nonempty watcher keeps running after ingestion; restart it before exporting with a newly generated queue. `--once` still scans twice, even for an empty queue.)
     - `cd /Users/davidnorris/code/export-chats-tooling && ruby capture_watch.rb`
 
 6. Copy and run the generated browser exporter.
@@ -287,7 +288,7 @@ and instructions for keeping projects separate.
     - `cd /Users/davidnorris/code/export-chats-tooling && pbcopy < .state/project_batch_console.js`
 
 7.  Wait for local ingestion to finish.
-    - (After the browser batch finishes, let the watcher finish processing all completed downloads. Check its output for rejected captures or errors, then stop the watcher with Ctrl-C.)
+    - (After the browser batch finishes, let the watcher finish processing all completed downloads. Rejected files remain in Downloads, with one warning per unchanged file/error per process. Changed files stabilize and undergo full validation again; restarting can report rejects again. Check its output, then stop the watcher with Ctrl-C.)
 
 8. Verify the archive.
     - `cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb`

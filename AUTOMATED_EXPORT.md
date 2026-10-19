@@ -382,6 +382,26 @@ ruby capture_watch.rb
 
 By default it watches `~/Downloads` for completed `AFCHAT_*.json` files. Set `CHAT_EXPORT_DOWNLOAD_DIR` or pass a second positional path if Firefox saves elsewhere.
 
+After startup validation, a normal watcher whose initial reconciled pending queue
+is empty reports completion and exits successfully without scanning Downloads or
+sleeping. Queue entries, not watcher completion totals, determine this condition.
+An initially nonempty watcher continues polling after successful captures. Rerun
+reconciliation and restart the watcher to load a newly generated queue.
+`--once` intentionally still makes two scans with a short stabilization sleep,
+even with an empty queue, and can diagnose leftover downloads.
+
+Rejected files stay in Downloads. Each unchanged file/error is diagnosed once
+per watcher process; different errors remain visible, and restarting can report
+the rejection again. Stabilization and warning suppression compare device,
+inode, mode, size, and full-resolution modification/change times. This detects
+normal same-size edits and replacements, including replacements preserving mtime;
+it does not detect deliberately forged filesystem metadata. Disappeared paths
+are forgotten. Changed files must stabilize and pass full validation again;
+unchanged retries also retain normal validation and overwrite checks. Existing
+status must be readable JSON with compatible project/account binding when present.
+Legacy unbound status is rebuilt too; its old completion entries never authorize
+captures.
+
 For every valid package the watcher:
 
 1. verifies project/account, inventory, full conversation identity and hashes;

@@ -22,6 +22,7 @@ class CaptureWatch
     @once = once
     @fault = fault
     @stable = {}
+    @rejected = {}
     raise CaptureWatchError, "download directory does not exist" unless Dir.exist?(@download_dir)
     current = @download_dir
     loop do
@@ -30,6 +31,7 @@ class CaptureWatch
       current = File.dirname(current)
     end
     @queue = SnapshotArchive.queue!(SnapshotArchive.parse(File.binread(state_path!("pending_ids.json"))))
+    validate_existing_status!
     @archive = SnapshotArchive.new(root: @data_repo, project_id: @queue["project_id"], account_id: @queue["account_id"])
     @status = { "schema" => "adventurefinder-chat-capture-status/v0.3", "project_id" => @queue["project_id"],
       "account_id" => @queue["account_id"], "queue_sha256" => @queue["sha256"], "completed" => {}, "ingested" => {} }
@@ -42,10 +44,14 @@ class CaptureWatch
     persist_status!
   end
 
-  # Poll stable downloads sequentially, or scan twice for --once. Returns nil;
-  # Ctrl-C leaves filesystem operations replayable through retained downloads.
+  # Poll stable downloads, returning nil immediately for an initially empty queue.
+  # --once always scans twice. Errors propagate; Ctrl-C retains replayable files.
   def run
     puts "Capture watcher: #{@queue["project_id"]}; #{@queue["pending"].length} queued; downloads #{@download_dir}"
+    if !@once && @queue["pending"].empty?
+      puts "Capture queue empty; watcher complete. Rerun reconciliation before restarting."
+      return
+    end
     loop do
       scan_once
       break if @once && @scanned
@@ -58,23 +64,51 @@ class CaptureWatch
 
   private
 
-  # Inspect sizes on consecutive polls; process only stable regular downloads.
-  # Rejections/errors remain on disk, with no completion acknowledgement.
+  # Compare stat fingerprints on consecutive polls; process stable regular files.
+  # Retain rejects and warn once per unchanged fingerprint/error in this process.
+  # Validation still runs on retries; filesystem changes/errors can be reconsidered.
   def scan_once
     paths = Dir.glob(File.join(@download_dir, CAPTURE_GLOB)).sort
     @stable.delete_if { |path, _| !paths.include?(path) }
+    @rejected.delete_if { |path, _| !paths.include?(path) }
     paths.each do |path|
-      raise CaptureWatchError, "symlink/non-file download refused" if File.symlink?(path) || !File.file?(path)
-      size = File.size(path)
+      fingerprint = nil
+      stat = File.lstat(path)
+      fingerprint = [stat.dev, stat.ino, stat.mode, stat.size, stat.mtime, stat.ctime]
+      raise CaptureWatchError, "symlink/non-file download refused" if stat.symlink? || !stat.file?
       prior = @stable[path]
-      @stable[path] = size
-      next unless prior == size
+      @stable[path] = fingerprint
+      next unless prior == fingerprint
       process_capture!(path)
       @stable.delete(path)
+      @rejected.delete(path)
     rescue SnapshotArchiveError, CaptureWatchError, JSON::ParserError, SystemCallError, KeyError, TypeError => error
-      warn "capture watcher: rejected/incomplete download left in place: #{path}: #{error.message}"
+      rejection = [fingerprint, error.class, error.message]
+      unless fingerprint && @rejected[path] == rejection
+        warn "capture watcher: rejected/incomplete download left in place: #{path}: #{error.message}"
+      end
+      @rejected[path] = rejection if fingerprint
       @stable.delete(path)
     end
+  end
+
+  # Refuse malformed or differently bound prior status before rebuilding it.
+  # Legacy unbound status is rebuilt too; old entries never authorize captures.
+  # Returns nil; JSON, checksum, binding and filesystem failures propagate.
+  def validate_existing_status!
+    path = state_path!("capture_status.json")
+    return unless File.exist?(path)
+    status = SnapshotArchive.parse(File.binread(path))
+    raise CaptureWatchError, "malformed capture_status.json" unless status.is_a?(Hash) &&
+      %w[completed ingested].all? { |field| !status.key?(field) || status[field].is_a?(Hash) }
+    if status.key?("project_id") && status["project_id"] != @queue["project_id"]
+      raise CaptureWatchError, "capture_status.json belongs to a different project"
+    end
+    if status.key?("account_id") && status["account_id"] != @queue["account_id"]
+      raise CaptureWatchError, "capture_status.json belongs to a different account"
+    end
+    SnapshotArchive.verify!(status) if status.key?("sha256")
+    nil
   end
 
   # Ingest one package, verify current and checkpoint, then remove it. Returns its
