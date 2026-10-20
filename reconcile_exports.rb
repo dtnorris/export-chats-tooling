@@ -68,7 +68,7 @@ module ReconcileHelpers
         lower = scaled.floor
         lower + (scaled - lower >= 0.5 ? 1 : 0)
       elsif value.is_a?(String)
-        match = /\A(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:\d{2})\z/.match(value)
+        match = /\A(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})\z/.match(value)
         return { value: nil, status: "invalid" } unless match
         year, month, day, hour, minute, second = match.captures.first(6).map(&:to_i)
         zone = match[8]
@@ -213,6 +213,29 @@ class ExportReconciler
       freshness_states = records.map do |record|
         { "id" => record["id"], "state" => "unknown-legacy-inventory", "selected" => false, "current" => nil }
       end
+    end
+    local_date = ENV["CHAT_EXPORT_ONLY_LOCAL_DATE"]
+    if local_date
+      begin
+        raise Date::Error unless /\A\d{4}-\d{2}-\d{2}\z/.match?(local_date) &&
+          Date.iso8601(local_date).iso8601 == local_date
+      rescue Date::Error
+        raise ReconcileError, "CHAT_EXPORT_ONLY_LOCAL_DATE must be YYYY-MM-DD"
+      end
+      unless inventory["schema"] == "adventurefinder-chat-project-inventory/v0.2" &&
+          records.all? { |record| record["update_time_status"] == "valid" }
+        raise ReconcileError, "date scope requires v0.2 inventory with all update timestamps valid"
+      end
+      active_ids = records.select do |record|
+        Time.iso8601(record["update_time"]).getlocal.strftime("%F") == local_date
+      end.to_h { |record| [record["id"], true] }
+      pending_ids = pending.to_h { |record| [record["id"], true] }
+      missing = active_ids.keys.reject { |id| pending_ids[id] || completed_ids[id] }
+      unless missing.empty?
+        raise ReconcileError, "date scope cannot account for active IDs: #{missing.join(', ')}"
+      end
+      pending.select! { |record| active_ids[record["id"]] }
+      freshness_states.each { |state| state["selected"] = false unless active_ids[state["id"]] }
     end
     report = {
       "schema" => RECONCILIATION_SCHEMA,

@@ -81,6 +81,31 @@ class ReconcileExportsTest < Minitest::Test
     JSON.parse(File.binread(File.join(@state, name)))
   end
 
+  # A scoped daily capture excludes old backlog without suppressing a current update.
+  def test_local_date_scope_selects_only_active_conversations
+    inventory = cumulative
+    inventory["conversations"].drop(1).each do |record|
+      record["update_time"] = "2025-12-31T00:00:00.125Z"
+    end
+    prior_tz, prior_scope = ENV.values_at("TZ", "CHAT_EXPORT_ONLY_LOCAL_DATE")
+    begin
+      ENV["TZ"] = "UTC"
+      ENV["CHAT_EXPORT_ONLY_LOCAL_DATE"] = "2026-01-01"
+      report = reconcile(sign(inventory))
+      assert_equal 1, report["pending_conversation_count"]
+      assert_equal ["current"], state("pending_ids.json")["pending"].map { |record| record["id"] }
+      assert_equal false, report["freshness"].find { |entry| entry["id"] == "old-pending" }["selected"]
+      SnapshotArchive.queue!(state("pending_ids.json"))
+      prior_queue = File.binread(File.join(@state, "pending_ids.json"))
+      ENV["CHAT_EXPORT_ONLY_LOCAL_DATE"] = "2026-10-44"
+      assert_raises(ReconcileError) { reconcile(sign(inventory)) }
+      assert_equal prior_queue, File.binread(File.join(@state, "pending_ids.json"))
+    ensure
+      ENV["TZ"] = prior_tz
+      ENV["CHAT_EXPORT_ONLY_LOCAL_DATE"] = prior_scope
+    end
+  end
+
   def test_partial_raw_pages_keep_every_old_pending_id_and_truthful_totals
     FileUtils.mkdir_p(File.join(@data, "raw"))
     File.binwrite(File.join(@data, "raw", "old-completed.json"), '{"id":"old-completed"}')
@@ -183,7 +208,8 @@ class ReconcileExportsTest < Minitest::Test
       "2024-02-29T12:34:56Z" => "2024-02-29T12:34:56.000Z",
       "1582-10-10T12:00:00Z" => "1582-10-10T12:00:00.000Z",
       "2026-10-10T14:00:00.1+02:00" => "2026-10-10T12:00:00.100Z",
-      "2026-10-10T08:30:00.12-03:30" => "2026-10-10T12:00:00.120Z"
+      "2026-10-10T08:30:00.12-03:30" => "2026-10-10T12:00:00.120Z",
+      "2026-10-20T00:52:03.380425Z" => "2026-10-20T00:52:03.380Z"
     }
     valid.each do |input, expected|
       assert_equal({ value: expected, status: "valid" }, ReconcileHelpers.inventory_timestamp(input), input.inspect)
@@ -195,7 +221,7 @@ class ReconcileExportsTest < Minitest::Test
      "1500-02-29T12:00:00Z", "2026-02-29T12:00:00Z", "2026-04-31T12:00:00Z", "0000-01-01T00:00:00Z", "2026-10-10",
      "2026-10-10T12:00:00", "2026-10-10T24:00:00Z", "2026-10-10T12:00:60Z",
      "2026-10-10T12:00:00+14:01", "2026-10-10T12:00:00-00:00", "2026-10-10T12:00:00+01:60",
-     "2026-10-10T12:00:00.1234Z", " "].each do |input|
+     "2026-10-10T12:00:00.1234567Z", " "].each do |input|
       assert_equal({ value: nil, status: "invalid" }, ReconcileHelpers.inventory_timestamp(input), input.inspect)
       assert_empty ReconcileHelpers.time_date_candidates(input)
     end

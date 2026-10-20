@@ -484,7 +484,9 @@ test("strict timestamp normalization retains JSON/CSV evidence without invented 
     ["1582-10-10T12:00:00Z", "1582-10-10T12:00:00.000Z"],
     ["2026-10-10T14:00:00.1+02:00", "2026-10-10T12:00:00.100Z"],
     ["2026-10-10T08:30:00.12-03:30", "2026-10-10T12:00:00.120Z"],
-    ["2026-10-11T02:00:00+14:00", "2026-10-10T12:00:00.000Z"]
+    ["2026-10-11T02:00:00+14:00", "2026-10-10T12:00:00.000Z"],
+    ["2026-10-20T00:52:03.380425Z", "2026-10-20T00:52:03.380Z"],
+    ["2026-10-20T00:52:03.1234Z", "2026-10-20T00:52:03.123Z"]
   ];
   const missing = [undefined, null, ""];
   const invalid = [NaN, Infinity, -Infinity, 1e20, -62135596801, 253402300800, true, {}, "1",
@@ -492,7 +494,7 @@ test("strict timestamp normalization retains JSON/CSV evidence without invented 
     "2026-10-10", "2026-10-10T12:00:00", "2026-10-10T24:00:00Z",
     "2026-10-10T12:00:60Z", "2026-10-10T12:00:00+14:01",
     "2026-10-10T12:00:00-00:00", "2026-10-10T12:00:00+01:60",
-    "2026-10-10T12:00:00.1234Z", " "];
+    "2026-10-10T12:00:00.1234567Z", " "];
   for (const [values, status] of [[valid, "valid"], [missing.map(value => [value, null]), "missing"], [invalid.map(value => [value, null]), "invalid"]]) {
     for (const [value, expected] of values) {
       const result = await inventoryRun([{ items: [{ ...item("dated"), create_time: value, update_time: value }], cursor: null }]);

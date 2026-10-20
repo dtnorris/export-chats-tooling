@@ -303,7 +303,7 @@
     if (typeof value === "number" && Number.isFinite(value)) {
       milliseconds = Math.round(value * 1000);
     } else if (typeof value === "string") {
-      const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+      const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
       if (!match) return { value: null, status: "invalid" };
       const [, year, month, day, hour, minute, second, , zone] = match;
       const offsetHour = zone === "Z" ? 0 : Number(zone.slice(1, 3));
