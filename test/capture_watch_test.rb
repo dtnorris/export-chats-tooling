@@ -20,7 +20,7 @@ class CaptureWatchTest < Minitest::Test
     @data, @downloads, @tooling = %w[data downloads tooling].map { |name| File.join(@root, name) }
     @state = File.join(@tooling, ".state")
     FileUtils.mkdir_p([@data, @downloads, @state])
-    %w[capture_watch.rb reconcile_exports.rb snapshot_archive.rb].each do |name|
+    %w[capture_watch.rb reconcile_exports.rb snapshot_archive.rb named_exports.rb].each do |name|
       FileUtils.cp(File.expand_path("../#{name}", __dir__), @tooling)
     end
     write_queue

@@ -129,6 +129,70 @@ class SnapshotArchiveTest < Minitest::Test
     Dir.glob(File.join(@data, "versions", "old-chat", "*", "version.json"))
   end
 
+  # The watcher automatically produces named copies; backfill restores missing
+  # copies without altering authoritative versions or overwriting legacy files.
+  def test_named_exports_are_additive_and_backfillable
+    File.binwrite(File.join(@data, "2020-01-01 - Legacy.md"), "Legacy unchanged\n")
+    queue, = reconcile
+    first = package(queue)
+    watch(JSON.generate(first))
+    named = Dir.glob(File.join(@data, "named", "*.md"))
+    assert_equal 1, named.length
+    assert_match(/2020-01-01 - Synthetic old-chat \[old-chat-[0-9a-f]{12}\]\.md\z/, named.first)
+    assert_equal first["markdown"], File.binread(named.first)
+    original = files
+    assert_equal ["named/#{File.basename(named.first)}"], NamedExports.new(@archive).backfill!
+    assert_equal original, files
+
+    File.delete(named.first)
+    output, errors, status = Open3.capture3(RbConfig.ruby,
+      File.expand_path("../named_exports.rb", __dir__), @data)
+    assert status.success?, errors
+    assert_includes output, "Verified named Markdown exports: 1"
+    assert_equal original, files
+
+    changed = raw(text: "Updated")
+    second = package(queue, changed, started: "2026-10-13T00:00:00.000Z", markdown: "Updated Markdown\n")
+    watch(JSON.generate(second))
+    assert_equal 2, Dir.glob(File.join(@data, "named", "*.md")).length
+    assert_equal first["markdown"], File.binread(named.first)
+    assert_equal "Legacy unchanged\n", File.binread(File.join(@data, "2020-01-01 - Legacy.md"))
+    assert_equal 2, versions.length
+  end
+
+  # Existing unrelated same-name bytes are never overwritten, even after the
+  # canonical bundle was installed; the original download remains replayable.
+  def test_named_export_conflict_preserves_download_for_retry
+    queue, = reconcile
+    version = SnapshotArchive.digest(raw)
+    name = "2020-01-01 - Synthetic old-chat [old-chat-#{version[0, 12]}].md"
+    named = File.join(@data, "named", name)
+    FileUtils.mkdir_p(File.dirname(named))
+    File.binwrite(named, "Do not replace me")
+    payload = JSON.generate(package(queue))
+    assert_raises(SnapshotArchiveError) { watch(payload) }
+    assert_equal "Do not replace me", File.binread(named)
+    assert File.exist?(File.join(@downloads, "AFCHAT_fixture.json"))
+    assert @archive.current!("old-chat")
+    File.delete(named)
+    watch(payload)
+    assert_equal "## Message 1\n\n### User\n\nHello\n", File.binread(named)
+    refute File.exist?(File.join(@downloads, "AFCHAT_fixture.json"))
+  end
+
+  # Missing creation evidence is labeled as capture date; unsafe title
+  # characters cannot create paths or remove the title from the filename.
+  def test_named_export_uses_safe_title_and_labeled_capture_date_fallback
+    listing = row.merge("title" => nil, "create_time" => nil)
+    queue, = reconcile(inventory([listing]))
+    source = raw(extra: { "title" => "A/Title: with\n punctuation?", "create_time" => nil })
+    watch(JSON.generate(package(queue, source)))
+    named = Dir.glob(File.join(@data, "named", "*.md"))
+    assert_equal 1, named.length
+    assert_match(/captured-2026-10-12 - A Title with punctuation \[old-chat-[0-9a-f]{12}\]\.md\z/, named.first)
+    refute_includes File.basename(named.first), "/"
+  end
+
   # Exercise browser capture, watcher, unchanged selection and an appended old chat.
   def test_pipeline_preserves_legacy_and_all_earlier_versions
     FileUtils.mkdir_p(File.join(@data, "raw"))

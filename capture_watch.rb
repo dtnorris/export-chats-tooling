@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require_relative "reconcile_exports"
+require_relative "named_exports"
 
 class CaptureWatchError < StandardError; end
 
@@ -120,6 +121,7 @@ class CaptureWatch
     id = JSON.parse(text).fetch("conversation_id")
     current = @archive.current!(id)
     raise CaptureWatchError, "complete current version required" unless current
+    NamedExports.new(@archive).write!(id)
     record_status(id, current)
     @fault&.call("before_checkpoint")
     persist_status!
