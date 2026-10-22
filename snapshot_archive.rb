@@ -269,9 +269,17 @@ class SnapshotArchive
     end
   end
 
+  # Return the content-relevant listing fields for retry accounting. Scan/audit
+  # provenance is retained in receipts but must not make unchanged content new.
+  # Accept a validated listing Hash and return its stable revision fields.
+  def listing_revision(listing)
+    listing.slice("id", "title", "create_time", "create_time_status", "update_time", "update_time_status")
+  end
+
   # Select new/updated IDs and at most ten unknown/retry captures. A disagreement
-  # gets at most two attempts per observation. Missing dates use a bounded audit
-  # lane, never daily history refetch. Returns [pending, per-ID evidence states].
+  # gets at most two attempts per listing revision. Missing dates use a bounded audit
+  # lane, never daily history refetch. Queue current work first, newest update
+  # first within each lane. Returns [pending, per-ID evidence states].
   def select(records, legacy_ids)
     recovery_count = 0
     states = records.to_h do |record|
@@ -280,7 +288,8 @@ class SnapshotArchive
       latest = current!(id)
       verified = latest && latest["freshness"] == "verified-as-listed" &&
         record["update_time_status"] == "valid" && latest.dig("listing", "update_time") == record["update_time"]
-      same_observation = receipts.select { |receipt| receipt["listing"] == record }
+      revision = listing_revision(record)
+      same_revision = receipts.select { |receipt| listing_revision(receipt["listing"]) == revision }
       reason = if verified
         "verified-unchanged"
       elsif latest.nil? && !receipts.empty?
@@ -289,20 +298,29 @@ class SnapshotArchive
         legacy_ids.include?(id) ? "unknown-legacy" : "new"
       elsif record["update_time_status"] != "valid"
         latest.dig("listing", "last_full_audit_at") == record["last_full_audit_at"] ? "unknown-wait-audit" : "unknown-audit"
-      elsif same_observation.length >= 2
+      elsif same_revision.length >= 2
         "unresolved-wait-inventory"
       else
         "updated"
       end
       candidate = %w[new updated incomplete unknown-legacy unknown-audit].include?(reason)
-      recovery = reason.start_with?("unknown") || reason == "incomplete" || (latest && latest["freshness"] == "unresolved")
+      recovery = reason.start_with?("unknown") || reason == "incomplete" ||
+        (latest && latest["freshness"] == "unresolved" && !same_revision.empty?)
       if candidate && recovery
         recovery_count += 1
         candidate = false if recovery_count > RECOVERY_LIMIT
       end
-      [id, { "id" => id, "state" => reason, "selected" => candidate, "current" => latest }]
+      [id, { "id" => id, "state" => reason, "selected" => candidate, "recovery" => !!recovery, "current" => latest }]
     end
-    pending = records.select { |record| states.fetch(record["id"])["selected"] }.map do |record|
+    pending = records.select { |record| states.fetch(record["id"])["selected"] }
+      .sort do |left, right|
+        left_recovery = states.fetch(left["id"])["recovery"] ? 1 : 0
+        right_recovery = states.fetch(right["id"])["recovery"] ? 1 : 0
+        comparison = left_recovery <=> right_recovery
+        comparison = right["update_time"].to_s <=> left["update_time"].to_s if comparison.zero?
+        comparison = left["id"] <=> right["id"] if comparison.zero?
+        comparison
+      end.map do |record|
       { "id" => record["id"], "title" => record["title"], "create_time" => record["create_time"],
         "update_time" => record["update_time"], "reason" => states.fetch(record["id"])["state"], "listing" => record }
     end

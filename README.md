@@ -53,6 +53,14 @@ unknown until captured through a ten-ID bootstrap lane. See the
 [update/version contract](AUTOMATED_EXPORT.md#daily-update-selection-and-unknown-freshness)
 for coverage, digest scope, races, bounded recovery and current/older-version lookup.
 
+An `Ingested ... (unresolved)` message means the content was archived successfully,
+but its fetched update timestamp disagrees with the project listing. The summary
+reports **snapshot archives** separately from **freshness verified** IDs. A new
+scan does not reset the two-attempt retry limit for unchanged listing fields.
+New conversations and first inspections of changed listings run before the bounded
+historical recovery lane, newest updates first; that lane may still deliberately
+select old chats.
+
 ### Repository Components
 
 | File | Responsibility | |---|---| | `project_inventory.js` | Project
@@ -292,6 +300,15 @@ and instructions for keeping projects separate.
 
 8. Verify the archive.
     - `cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb`
-    - (Review pending, unknown/deferred and per-ID freshness states. Partial discovery has conditional coverage; full audits recover visible records outside overlap. Current content can remain unresolved after a race or unusable source timestamp.)
+    - (Review snapshot archives, freshness verified, queue reasons, and per-ID freshness states. An archived snapshot can have unresolved freshness. Unresolved root Markdown includes unmatched Codex exports and is not a missing-chat count. Partial discovery has conditional coverage; full audits recover visible records outside overlap.)
     - (If IDs remain, investigate the watcher and browser output before retrying. Start a fresh watcher before running the regenerated exporter.)
     - (When finished, stop caffeinate with Ctrl-C in its terminal.)
+
+For a retrospective day, use the existing local-date scope with the intended
+timezone, for example `TZ=America/New_York CHAT_EXPORT_ONLY_LOCAL_DATE=2026-10-21 ruby reconcile_exports.rb`.
+This selects known conversations whose latest listing update falls on that date;
+it is not an independent discovery audit or proof of every message written that day.
+An exhaustive inventory establishes what the endpoint exposed at scan time;
+compare its IDs against the generated per-ID freshness report before claiming the
+day is fully captured. A changed listing with an older saved snapshot still needs
+capture even if the ID already has archived files.

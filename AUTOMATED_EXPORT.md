@@ -216,7 +216,12 @@ checksummed v0.2 queue with the inventory checksum, exact inventory-file SHA-256
 scan/audit provenance and each selected cumulative listing record.
 
 `reconciliation.json` separates `legacy_evidence` from verified `completed` and
-per-ID `freshness` states. An old creation date does not suppress a recent update.
+per-ID `freshness` states. `archived_conversation_count` counts verified complete
+snapshot bundles regardless of timestamp agreement; `archived_unresolved_count`
+counts the subset with unresolved freshness. These are distinct from freshness
+completion. `unresolved_markdown_payloads` concerns legacy root-file matching
+(including Codex sessions), not the number of conversations missing content.
+An old creation date does not suppress a recent update.
 `new` identifies IDs without historical matching or a verified snapshot. `updated`
 means the latest listing differs from captured evidence or freshness is unresolved.
 `verified-unchanged` skips capture when the latest complete observation agreed with
@@ -231,16 +236,28 @@ At most **ten** unknown/bootstrap/recovery IDs are selected per reconciliation,
 in full-ID lexical order. Further IDs remain explicitly deferred; rerun after
 draining the selected queue to progress through a large legacy archive. This is
 an operator-driven bootstrap, not a daily full-history capture. Genuinely new IDs
-and first inspections of changed verified IDs do not use this ten-ID budget.
+and first inspections of changed listings do not use this ten-ID budget, including
+when the previous capture was unresolved. They precede recovery entries in the
+browser queue, with newest updates first within each lane.
 
 A valid but disagreeing listing/fetch pair gets at most **two distinct captured
-attempts per exact listing observation**. Exact download replay consumes no extra
-attempt. Afterward it remains `unresolved-wait-inventory`; a later observed listing
-allows another bounded attempt. Missing/invalid source update times remain
+attempts per stable listing revision**: identity, title, creation/update values
+and their statuses. Exact download replay consumes no extra attempt. Scan flags,
+observation times and audit lineage remain in immutable receipts but do not reset
+this limit. Afterward it remains `unresolved-wait-inventory`; changed listing
+fields allow a new inspection. Missing/invalid source update times remain
 unresolved and use `unknown-wait-audit` after a capture, with at most ten selected
 on a later full audit (`unknown-audit`). There is no per-day refetch of every old
 chat. Zero pending may coexist with unknown/deferred IDs: inspect the report.
 An absent ID in a partial listing never removes any archived file or observation.
+
+Listing and conversation endpoints can report different update times. ISO input
+currently truncates sub-millisecond digits while numeric seconds round them, so
+even the same source instant can differ by one millisecond. Larger disagreements
+also occur. Ingestion preserves those captures as unresolved; this repair does
+not introduce a timestamp tolerance, rewrite immutable receipts, or claim that
+disagreeing endpoints prove freshness. The bounded retry policy prevents those
+disagreements from causing unlimited recapture of an unchanged listing.
 
 ### Version storage, digest and current lookup
 

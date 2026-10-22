@@ -267,11 +267,59 @@ class SnapshotArchiveTest < Minitest::Test
     assert_empty pending["pending"]
     assert_equal "unresolved-wait-inventory", report["freshness"].first["state"]
     assert_equal 1, report["unknown_or_unresolved_count"]
-    future, = reconcile(inventory([row(update: advanced)], scan: "2026-10-14T00:00:00.000Z"))
+    future, = reconcile(inventory([row(update: "2026-10-13T00:00:00.000Z")], scan: "2026-10-14T00:00:00.000Z"))
     assert_equal ["old-chat"], future["pending"].map { |entry| entry["id"] }
-    changed = raw(update: advanced, text: "Caught up")
+    changed = raw(update: "2026-10-13T00:00:00.000Z", text: "Caught up")
     @archive.ingest(JSON.generate(package(future, changed, started: "2026-10-15T00:00:00.000Z")), future)
     assert_equal "verified-as-listed", @archive.current!("old-chat")["freshness"]
+  end
+
+  # Daily/full-audit provenance changes must not reset two attempts for the same
+  # listing revision. Real update/title changes remain eligible for inspection.
+  def test_unchanged_listing_rescans_do_not_reset_retry_budget
+    queue, = reconcile
+    mismatched = raw(update: "2026-10-09T12:00:03.000Z")
+    2.times do |index|
+      @archive.ingest(JSON.generate(package(queue, mismatched,
+        started: "2026-10-1#{2 + index}T12:00:00.000Z")), queue)
+    end
+    future, report = reconcile(inventory(scan: "2026-10-14T00:00:00.000Z"))
+    assert_empty future["pending"]
+    assert_equal "unresolved-wait-inventory", report["freshness"].first["state"]
+    assert_equal 1, report["archived_conversation_count"]
+    assert_equal 1, report["archived_unresolved_count"]
+    assert_equal 0, report["completed_conversation_count"]
+    changed, = reconcile(inventory([row(update: "2026-10-13T00:00:00.000Z")],
+      scan: "2026-10-14T00:00:00.000Z"))
+    assert_equal ["old-chat"], changed["pending"].map { |entry| entry["id"] }
+  end
+
+  # A current update to an unresolved capture is a first inspection of changed
+  # evidence, even when ten older legacy conversations fill the recovery lane.
+  def test_changed_unresolved_listing_bypasses_recovery_budget
+    target = "z-active-chat"
+    first, = reconcile(inventory([row(target)]))
+    @archive.ingest(JSON.generate(package(first, raw(target,
+      update: "2026-10-09T12:00:03.000Z"))), first)
+    legacy = 10.times.map { |index| row("a-legacy-#{index}") }
+    FileUtils.mkdir_p(File.join(@data, "raw"))
+    legacy.each do |entry|
+      File.binwrite(File.join(@data, "raw", entry["id"] + ".json"), JSON.generate({ "id" => entry["id"] }))
+    end
+    queue, report = reconcile(inventory(legacy + [row(target, update: "2026-10-11T00:00:00.000Z")],
+      scan: "2026-10-11T12:00:00.000Z"))
+    assert_includes queue["pending"].map { |entry| entry["id"] }, target
+    assert_equal 11, queue["pending"].length
+    assert_equal target, queue["pending"].first["id"]
+    assert_equal true, report["freshness"].find { |entry| entry["id"] == target }["selected"]
+    changed = raw(target, update: "2026-10-11T00:00:00.000Z", text: "New daily content")
+    downloaded = browser(queue, [changed], { "limit" => 1, "now" => "2026-10-13T12:00:00.000Z" })
+    assert_nil downloaded["error"]
+    refute File.exist?(watch(downloaded["downloads"].fetch(0).fetch("text")))
+    repeated, = reconcile(inventory(legacy + [row(target, update: "2026-10-11T00:00:00.000Z")],
+      scan: "2026-10-11T12:00:00.000Z"))
+    refute_includes repeated["pending"].map { |entry| entry["id"] }, target
+    assert_equal "verified-as-listed", @archive.current!(target)["freshness"]
   end
 
   # A fetch racing ahead of listing is retained but cannot advance freshness.
