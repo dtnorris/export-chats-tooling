@@ -19,7 +19,9 @@ end
 # corrupt evidence or conflicts; historical files are never replaced.
 class SnapshotArchive
   SCHEMA = "chat-snapshot/v1"
-  OBSERVATION_SCHEMA = "chat-observation/v1"
+  LEGACY_OBSERVATION_SCHEMA = "chat-observation/v1"
+  OBSERVATION_SCHEMA = "chat-observation/v2"
+  FRESHNESS_TOLERANCE_SECONDS = 1
   QUEUE_SCHEMA = "adventurefinder-chat-pending-queue/v0.2"
   CAPTURE_SCHEMA = "adventurefinder-chat-download-capture/v0.2"
   RENDERER = "active-branch/v1"
@@ -218,7 +220,7 @@ class SnapshotArchive
     Dir.children(directory).grep(/\A[0-9a-f]{64}\z/).each { |version| version!(id, version) }
     receipts = Dir.glob(path!("versions/#{id}/observations/*.json")).map do |path|
       receipt = self.class.verify!(self.class.parse(File.binread(path!(path.delete_prefix(@root + "/")))))
-      raise SnapshotArchiveError, "observation binding mismatch" unless receipt["schema"] == OBSERVATION_SCHEMA &&
+      raise SnapshotArchiveError, "observation binding mismatch" unless [LEGACY_OBSERVATION_SCHEMA, OBSERVATION_SCHEMA].include?(receipt["schema"]) &&
         receipt["project_id"] == @project_id && receipt["account_id"] == @account_id && receipt["conversation_id"] == id &&
         /\A[0-9a-f]{64}\z/.match?(receipt["package_sha256"].to_s) && File.basename(path) == "#{receipt["package_sha256"]}.json"
       %w[request_started_at captured_at].each { |field| self.class.time!(receipt[field]) }
@@ -235,7 +237,7 @@ class SnapshotArchive
       raw = self.class.parse(File.binread(path!("versions/#{id}/#{receipt["version"]}/raw.json")))
       fetched = ReconcileHelpers.inventory_timestamp(raw["update_time"])
       raise SnapshotArchiveError, "observation freshness conflict" unless receipt["fetched_update"] == fetched.transform_keys(&:to_s) &&
-        receipt["freshness"] == freshness(receipt["listing"], fetched, receipt["request_started_at"])
+        receipt["freshness"] == freshness(receipt["listing"], fetched, receipt["request_started_at"], schema: receipt["schema"])
       receipt
     end
     receipts.sort_by { |receipt| [receipt["request_started_at"], receipt["captured_at"], receipt["version"], receipt["package_sha256"]] }
@@ -258,15 +260,40 @@ class SnapshotArchive
     receipts.last
   end
 
-  # Return conservative freshness against the actual fetched timestamp. Agreement
-  # is evidence as listed, never a claim of an atomic server snapshot.
-  def freshness(listing, fetched, started)
+  # Compare validated listing/fetched timestamps without rounding or changing them.
+  # v1 receipts require equality; v2 accepts an inclusive one-second difference.
+  # Neither source time may exceed request start. Returns a freshness String;
+  # raises SnapshotArchiveError for unknown policies; timestamp parsing errors propagate.
+  def freshness(listing, fetched, started, schema: OBSERVATION_SCHEMA)
+    tolerance = case schema
+    when LEGACY_OBSERVATION_SCHEMA then 0
+    when OBSERVATION_SCHEMA then FRESHNESS_TOLERANCE_SECONDS
+    else raise SnapshotArchiveError, "unsupported observation freshness policy"
+    end
     if listing.is_a?(Hash) && listing["update_time_status"] == "valid" && fetched[:status] == "valid" &&
-        listing["update_time"] == fetched[:value] && fetched[:value] <= started && listing["last_observed_at"] <= started
+        listing["update_time"] <= started && fetched[:value] <= started && listing["last_observed_at"] <= started &&
+        (Time.iso8601(listing["update_time"]).to_r - Time.iso8601(fetched[:value]).to_r).abs <= tolerance
       "verified-as-listed"
     else
       "unresolved"
     end
+  end
+
+  # Reassess an already validated receipt under today's tolerance without rewriting
+  # its historical schema, timestamps or freshness. Returns a freshness String;
+  # required-field/parse errors propagate for malformed caller input.
+  def capture_freshness(receipt)
+    freshness(receipt.fetch("listing"), receipt.fetch("fetched_update").transform_keys(&:to_sym),
+      receipt.fetch("request_started_at"))
+  end
+
+  # Return whether a checked capture matches an unchanged exact listing update.
+  # Tolerance applies only inside the capture; even a 1 ms listing change must
+  # request inspection. Accept nil current evidence; malformed inputs raise.
+  def verified_unchanged?(current, listing)
+    current && listing["update_time_status"] == "valid" &&
+      current.dig("listing", "update_time") == listing["update_time"] &&
+      capture_freshness(current) == "verified-as-listed"
   end
 
   # Return the content-relevant listing fields for retry accounting. Scan/audit
@@ -286,8 +313,8 @@ class SnapshotArchive
       id = self.class.identity!(record.fetch("id"))
       receipts = observations(id)
       latest = current!(id)
-      verified = latest && latest["freshness"] == "verified-as-listed" &&
-        record["update_time_status"] == "valid" && latest.dig("listing", "update_time") == record["update_time"]
+      evaluated_freshness = latest && capture_freshness(latest)
+      verified = verified_unchanged?(latest, record)
       revision = listing_revision(record)
       same_revision = receipts.select { |receipt| listing_revision(receipt["listing"]) == revision }
       reason = if verified
@@ -305,12 +332,13 @@ class SnapshotArchive
       end
       candidate = %w[new updated incomplete unknown-legacy unknown-audit].include?(reason)
       recovery = reason.start_with?("unknown") || reason == "incomplete" ||
-        (latest && latest["freshness"] == "unresolved" && !same_revision.empty?)
+        (latest && evaluated_freshness == "unresolved" && !same_revision.empty?)
       if candidate && recovery
         recovery_count += 1
         candidate = false if recovery_count > RECOVERY_LIMIT
       end
-      [id, { "id" => id, "state" => reason, "selected" => candidate, "recovery" => !!recovery, "current" => latest }]
+      [id, { "id" => id, "state" => reason, "selected" => candidate, "recovery" => !!recovery,
+        "freshness" => evaluated_freshness, "current" => latest }]
     end
     pending = records.select { |record| states.fetch(record["id"])["selected"] }
       .sort do |left, right|
@@ -355,15 +383,22 @@ class SnapshotArchive
       "conversation_id" => id, "version" => version, "renderer" => RENDERER,
       "raw_sha256" => payload["raw_sha256"], "markdown_sha256" => payload["markdown_sha256"] })
     package_hash = Digest::SHA256.hexdigest(package_text)
+    receipt_path = "versions/#{id}/observations/#{package_hash}.json"
+    # Exact historical package replay must reproduce the original receipt bytes.
+    # Its schema is checked here and by current! before any archive writes.
+    receipt_schema = if File.exist?(path!(receipt_path))
+      self.class.verify!(self.class.parse(File.binread(path!(receipt_path)))).fetch("schema")
+    else
+      OBSERVATION_SCHEMA
+    end
     fetched = ReconcileHelpers.inventory_timestamp(raw["update_time"])
-    receipt = self.class.seal({ "schema" => OBSERVATION_SCHEMA, "project_id" => @project_id, "account_id" => @account_id,
+    receipt = self.class.seal({ "schema" => receipt_schema, "project_id" => @project_id, "account_id" => @account_id,
       "conversation_id" => id, "version" => version, "package_sha256" => package_hash,
       "source" => queue["source"], "queue_sha256" => queue["sha256"], "listing" => entry["listing"],
       "request_started_at" => payload["request_started_at"], "captured_at" => payload["captured_at"],
-      "fetched_update" => fetched, "freshness" => freshness(entry["listing"], fetched, payload["request_started_at"]),
+      "fetched_update" => fetched, "freshness" => freshness(entry["listing"], fetched, payload["request_started_at"], schema: receipt_schema),
       "raw_sha256" => payload["raw_sha256"], "markdown_sha256" => payload["markdown_sha256"], "message_count" => payload["message_count"] })
     base = "versions/#{id}/#{version}"
-    receipt_path = "versions/#{id}/observations/#{package_hash}.json"
     stage = "versions/.incoming/#{package_hash}"
     staged_files = { "raw" => ["raw.json", raw_text], "markdown" => ["conversation.md", markdown],
       "version" => ["version.json", JSON.pretty_generate(metadata) + "\n"] }

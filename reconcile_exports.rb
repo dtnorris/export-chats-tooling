@@ -252,7 +252,8 @@ class ExportReconciler
       "completed_conversation_count" => completed_ids.length,
       "pending_conversation_count" => pending.length,
       "archived_conversation_count" => freshness_states.count { |entry| entry["current"] },
-      "archived_unresolved_count" => freshness_states.count { |entry| entry.dig("current", "freshness") == "unresolved" },
+      "archived_unresolved_count" => freshness_states.count { |entry| entry["freshness"] == "unresolved" },
+      "freshness_tolerance_seconds" => SnapshotArchive::FRESHNESS_TOLERANCE_SECONDS,
       "completed" => completed,
       "legacy_evidence" => legacy_evidence,
       "freshness" => freshness_states,
@@ -612,6 +613,7 @@ class ExportReconciler
     puts "Existing payloads: #{report.fetch("unique_markdown_payload_count")} unique Markdown payloads"
     puts "Snapshot archives: #{report.fetch("archived_conversation_count")} (#{report.fetch("archived_unresolved_count")} unresolved freshness)"
     puts "Freshness verified: #{report.fetch("completed_conversation_count")}"
+    puts "Freshness tolerance: #{report.fetch("freshness_tolerance_seconds")} second (listing change detection remains exact)"
     puts "Pending IDs:       #{report.fetch("pending_conversation_count")}"
     puts "Unknown/deferred:  #{report.fetch("unknown_or_unresolved_count", 0)} (inspect freshness states; zero pending need not mean current)"
     puts "Legacy inventory cannot authorize capture; establish a matching ECT-01 v0.2 inventory." if report["inventory_coverage"] == "legacy-unverified"

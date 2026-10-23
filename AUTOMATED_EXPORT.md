@@ -218,14 +218,20 @@ scan/audit provenance and each selected cumulative listing record.
 `reconciliation.json` separates `legacy_evidence` from verified `completed` and
 per-ID `freshness` states. `archived_conversation_count` counts verified complete
 snapshot bundles regardless of timestamp agreement; `archived_unresolved_count`
-counts the subset with unresolved freshness. These are distinct from freshness
+counts the subset unresolved under the current tolerance. These are distinct from freshness
 completion. `unresolved_markdown_payloads` concerns legacy root-file matching
 (including Codex sessions), not the number of conversations missing content.
 An old creation date does not suppress a recent update.
 `new` identifies IDs without historical matching or a verified snapshot. `updated`
 means the latest listing differs from captured evidence or freshness is unresolved.
-`verified-unchanged` skips capture when the latest complete observation agreed with
-the fetched update time and the current listing still has that same valid time.
+`verified-unchanged` skips capture when a checked capture's valid listing and fetched
+update times differ by at most **one second, inclusive**, in either direction, and
+the current listing update time still matches the captured listing **exactly**.
+Neither update timestamp may be later than request start. Tolerance is applied
+only to freshness agreement, using exact rational seconds without rounding;
+inventories, watermarks, revision keys, source timestamps and content digests
+are unchanged. Timestamp normalization is unchanged. A one-millisecond listing
+change still requests inspection.
 This assumes the provider changes update time when content changes; equal-time
 provider changes cannot be discovered from timestamps alone.
 
@@ -253,11 +259,23 @@ An absent ID in a partial listing never removes any archived file or observation
 
 Listing and conversation endpoints can report different update times. ISO input
 currently truncates sub-millisecond digits while numeric seconds round them, so
-even the same source instant can differ by one millisecond. Larger disagreements
-also occur. Ingestion preserves those captures as unresolved; this repair does
-not introduce a timestamp tolerance, rewrite immutable receipts, or claim that
-disagreeing endpoints prove freshness. The bounded retry policy prevents those
-disagreements from causing unlimited recapture of an unchanged listing.
+even the same source instant can differ by one millisecond. New `chat-observation/v2`
+receipts record freshness using the one-second tolerance. Existing
+`chat-observation/v1` receipts continue to validate under their original exact
+comparison, including exact package replay. Mixed journals are supported; unknown
+schemas and falsified historical freshness fail closed. Tools predating v2 cannot
+read new v2 receipts; retain the upgraded tooling when using those captures.
+
+Reconciliation and watcher completion also reassess checked historical receipts
+under the current tolerance without rewriting their bytes, checksum, original
+freshness or `current.json`. No recapture is needed for a qualifying v1 receipt.
+The report's per-ID `freshness` contains this current evaluation; nested `current`
+is the original receipt and may still say `unresolved`. The report/checkpoint's
+`freshness_tolerance_seconds` records the current rule. Missing/invalid timestamp
+evidence and differences greater than one second remain unresolved; raw-only
+legacy files are not promoted. The tolerance is a practical agreement policy,
+not proof of an atomic server snapshot or identical content within that interval.
+The bounded retry policy still prevents unlimited recapture of unchanged listings.
 
 ### Version storage, digest and current lookup
 

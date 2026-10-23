@@ -54,12 +54,23 @@ unknown until captured through a ten-ID bootstrap lane. See the
 for coverage, digest scope, races, bounded recovery and current/older-version lookup.
 
 An `Ingested ... (unresolved)` message means the content was archived successfully,
-but its fetched update timestamp disagrees with the project listing. The summary
+but freshness could not be established against the project listing. Valid listing
+and fetched timestamps may differ by **up to one second, inclusive**, in either
+direction. Neither may be later than request start. Full timestamps remain intact;
+even a one-millisecond change to a listing's update time still queues inspection.
+The summary
 reports **snapshot archives** separately from **freshness verified** IDs. A new
 scan does not reset the two-attempt retry limit for unchanged listing fields.
 New conversations and first inspections of changed listings run before the bounded
 historical recovery lane, newest updates first; that lane may still deliberately
 select old chats.
+
+Rerun reconciliation after upgrading to reassess existing complete captures with
+this tolerance; no inventory sweep or recapture is required for that reassessment.
+Historical observation receipts retain their original schema and freshness value.
+The per-ID report's `freshness` field shows today's evaluation; its `current` field
+contains the unchanged historical receipt. Raw-only/legacy files without a checked
+snapshot still require the existing bootstrap workflow.
 
 ### Repository Components
 
@@ -275,6 +286,7 @@ and instructions for keeping projects separate.
     - (No expected count is required. If you previously enabled the optional audit, clear it with `delete window.__chatProjectInventoryExpectedCount` first.)
     - `cd /Users/davidnorris/code/export-chats-tooling && pbcopy < project_inventory.js`
     - `cd /Users/davidnorris/code/export-chats-tooling && pbcopy < .state/project_inventory_console.js`
+    - `cd /Users/davidnorris/code/export-chats-tooling && pbcopy < .state/project_batch_console.js`
     - First run: copy project_inventory.js from the tooling checkout.
     - Later runs: copy .state/project_inventory_console.js after reconciliation.
     - Use pbcopy < the chosen script, then paste it into the browser console.
@@ -312,3 +324,29 @@ An exhaustive inventory establishes what the endpoint exposed at scan time;
 compare its IDs against the generated per-ID freshness report before claiming the
 day is fully captured. A changed listing with an older saved snapshot still needs
 capture even if the ID already has archived files.
+Date scope can fail closed when active IDs remain unresolved and deferred by the
+recovery budget; use unscoped reconciliation to inspect that situation.
+
+
+## 10/23 Notes (Full Reset)
+1. caffeinate -dimsu
+2. delete window.__chatProjectInventoryExpectedCount; window.__chatProjectInventoryFullAudit = true;
+3. cd /Users/davidnorris/code/export-chats-tooling && git status --short && pbcopy < .state/project_inventory_console.js
+4. <move the downloads in export-chats-data>
+5. cd /Users/davidnorris/code/export-chats-tooling &&
+env -u CHAT_EXPORT_ONLY_LOCAL_DATE ruby reconcile_exports.rb /Users/davidnorris/code/export-chats-data "/Users/davidnorris/code/export-chats-data/2026-10-23 - ChatGPT g-p-6a75a7bb03108191bac6b26aa275267e Project Inventory.json"
+6. cd /Users/davidnorris/code/export-chats-tooling && ruby capture_watch.rb /Users/davidnorris/code/export-chats-data
+7. delete window.__chatProjectBatchLimit;
+8. cd /Users/davidnorris/code/export-chats-tooling && pbcopy < .state/project_batch_console.js
+
+## 10/23 Notes (Tonight)
+1. caffeinate -dimsu
+2. delete window.__chatProjectInventoryExpectedCount; delete window.__chatProjectInventoryFullAudit;
+3. <move the downloads in export-chats-data>
+4. cd /Users/davidnorris/code/export-chats-tooling && pbcopy < .state/project_inventory_console.js
+5. cd /Users/davidnorris/code/export-chats-tooling && env -u CHAT_EXPORT_ONLY_LOCAL_DATE ruby reconcile_exports.rb && /Users/davidnorris/code/export-chats-data && "/Users/davidnorris/code/export-chats-data/2026-10-23 - AdventureFinder Nightly Project Inventory.json"
+6. cd /Users/davidnorris/code/export-chats-tooling && ruby capture_watch.rb && /Users/davidnorris/code/export-chats-data && /Users/davidnorris/Downloads
+7. delete window.__chatProjectBatchLimit;
+8. cd /Users/davidnorris/code/export-chats-tooling && pbcopy < .state/project_batch_console.js
+
+9. <after> cd /Users/davidnorris/code/export-chats-tooling && env -u CHAT_EXPORT_ONLY_LOCAL_DATE ruby reconcile_exports.rb && /Users/davidnorris/code/export-chats-data && "/Users/davidnorris/code/export-chats-data/2026-10-23 - AdventureFinder Nightly Project Inventory.json"

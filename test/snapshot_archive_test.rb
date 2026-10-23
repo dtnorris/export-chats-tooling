@@ -117,6 +117,114 @@ class SnapshotArchiveTest < Minitest::Test
     JSON.parse(File.binread(path))
   end
 
+  # Install a historical v1 receipt over a valid synthetic bundle. Inputs have
+  # valid past timestamps; return its original package bytes for replay tests.
+  # Only this disposable fixture's receipt/index are rewritten; errors propagate.
+  def legacy_capture(queue, content)
+    text = JSON.generate(package(queue, content))
+    current = @archive.ingest(text, queue)
+    exact = current.dig("listing", "update_time") == current.dig("fetched_update", "value")
+    legacy = SnapshotArchive.seal(current.merge("schema" => "chat-observation/v1",
+      "freshness" => exact ? "verified-as-listed" : "unresolved"))
+    base = File.join(@data, "versions", content.fetch("id"))
+    [File.join(base, "observations", current.fetch("package_sha256") + ".json"),
+      File.join(base, "current.json")].each { |path| File.binwrite(path, JSON.pretty_generate(legacy) + "\n") }
+    text
+  end
+
+  # The inclusive tolerance crosses second boundaries without accepting >1 second,
+  # missing/invalid evidence, or either source timestamp after request start.
+  def test_one_second_freshness_boundaries_and_clock_guards
+    listing = inventory.fetch("conversations").first
+    [-1000, -999, -155, 0, 155, 999, 1000, -1001, 1001, 60_000].each do |offset|
+      fetched = { status: "valid", value: (Time.iso8601(UPDATE) + Rational(offset, 1000)).iso8601(3) }
+      expected = offset.abs <= 1000 ? "verified-as-listed" : "unresolved"
+      assert_equal expected, @archive.freshness(listing, fetched, CAPTURE), offset.inspect
+    end
+    crossing = listing.merge("update_time" => "2026-10-09T11:59:59.999Z")
+    fetched = { status: "valid", value: "2026-10-09T12:00:00.001Z" }
+    assert_equal "verified-as-listed", @archive.freshness(crossing, fetched, CAPTURE)
+    %w[missing invalid].each do |status|
+      assert_equal "unresolved", @archive.freshness(listing, { status: status, value: nil }, CAPTURE)
+      assert_equal "unresolved", @archive.freshness(listing.merge("update_time_status" => status, "update_time" => nil), fetched, CAPTURE)
+    end
+    fetched = { status: "valid", value: CAPTURE }
+    future = "2026-10-12T12:00:00.500Z"
+    assert_equal "unresolved", @archive.freshness(listing.merge("update_time" => future), fetched, CAPTURE)
+    assert_equal "unresolved", @archive.freshness(listing.merge("update_time" => CAPTURE), fetched.merge(value: future), CAPTURE)
+    assert_equal "unresolved", @archive.freshness(listing.merge("update_time" => CAPTURE, "last_observed_at" => future), fetched, CAPTURE)
+  end
+
+  # Exercise the real browser program, watcher, checkpoint and reconciliation for
+  # a 155 ms discrepancy. A subsequent 1 ms listing change must still queue work.
+  def test_tolerant_pipeline_keeps_listing_change_detection_exact
+    listed = "2026-10-09T12:00:32.599Z"
+    rows = [row(update: listed)]
+    queue, = reconcile(inventory(rows))
+    content = raw(update: Time.iso8601("2026-10-09T12:00:32.754Z").to_f)
+    downloaded = browser(queue, [content])
+    assert_nil downloaded["error"]
+    refute File.exist?(watch(downloaded["downloads"].fetch(0).fetch("text")))
+    current = @archive.current!("old-chat")
+    assert_equal "chat-observation/v2", current["schema"]
+    assert_equal "verified-as-listed", current["freshness"]
+    assert read_json(File.join(@state, "capture_status.json"))["completed"].key?("old-chat")
+    repeated, report = reconcile(inventory(rows))
+    assert_empty repeated["pending"]
+    assert_equal 1, report["completed_conversation_count"]
+    changed, = reconcile(inventory([row(update: "2026-10-09T12:00:32.600Z")]))
+    assert_equal ["old-chat"], changed["pending"].map { |entry| entry["id"] }
+  end
+
+  # Reassess checked v1 evidence locally, preserve its bytes and exact-rule truth,
+  # and allow replay of the original package after the policy update.
+  def test_legacy_receipt_reassessment_and_replay_preserve_history
+    queue, = reconcile
+    text = legacy_capture(queue, raw(update: "2026-10-09T12:00:00.155Z"))
+    NamedExports.new(@archive).write!("old-chat")
+    legacy = @archive.current!("old-chat")
+    receipt_path = File.join(@data, "versions", "old-chat", "observations", legacy["package_sha256"] + ".json")
+    original_receipt = File.binread(receipt_path)
+    File.binwrite(receipt_path, JSON.pretty_generate(SnapshotArchive.seal(legacy.merge("freshness" => "verified-as-listed"))))
+    assert_raises(SnapshotArchiveError) { @archive.current!("old-chat") }
+    File.binwrite(receipt_path, original_receipt)
+    original = files
+    repeated, report = reconcile
+    assert_empty repeated["pending"]
+    assert_equal 1, report["completed_conversation_count"]
+    assert_equal 0, report["archived_unresolved_count"]
+    assert_equal "verified-as-listed", report["freshness"].first["freshness"]
+    assert_equal "unresolved", @archive.current!("old-chat")["freshness"]
+    assert_equal original, files
+    File.binwrite(File.join(@state, "pending_ids.json"), JSON.pretty_generate(queue))
+    refute File.exist?(watch(text))
+    assert read_json(File.join(@state, "capture_status.json"))["completed"].key?("old-chat")
+    assert_equal "chat-observation/v1", @archive.current!("old-chat")["schema"]
+    assert_equal original, files
+    mixed = JSON.generate(package(queue, raw(text: "New content", update: "2026-10-09T12:00:00.155Z"),
+      started: "2026-10-13T12:00:00.000Z"))
+    watch(mixed)
+    assert_equal %w[chat-observation/v1 chat-observation/v2], @archive.observations("old-chat").map { |receipt| receipt["schema"] }
+    assert_equal original_receipt, File.binread(receipt_path)
+  end
+
+  # A legacy mismatch outside tolerance remains unresolved. Re-sealing a forged
+  # v1 freshness claim or an unknown observation schema cannot bypass validation.
+  def test_legacy_strict_validation_and_unknown_policy_fail_closed
+    queue, = reconcile
+    legacy_capture(queue, raw(update: "2026-10-09T12:00:01.001Z"))
+    pending, report = reconcile
+    assert_equal ["old-chat"], pending["pending"].map { |entry| entry["id"] }
+    assert_equal 0, report["completed_conversation_count"]
+    assert_equal 1, report["archived_unresolved_count"]
+    current = @archive.current!("old-chat")
+    path = File.join(@data, "versions", "old-chat", "observations", current["package_sha256"] + ".json")
+    [current.merge("freshness" => "verified-as-listed"), current.merge("schema" => "chat-observation/v99")].each do |forged|
+      File.binwrite(path, JSON.pretty_generate(SnapshotArchive.seal(forged)))
+      assert_raises(SnapshotArchiveError) { @archive.current!("old-chat") }
+    end
+  end
+
   # Hash every existing archive file, preserving paths as well as bytes.
   def files
     Dir.glob(File.join(@data, "**", "*"), File::FNM_DOTMATCH).select { |path| File.file?(path) }.to_h do |path|

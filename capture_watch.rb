@@ -35,7 +35,8 @@ class CaptureWatch
     validate_existing_status!
     @archive = SnapshotArchive.new(root: @data_repo, project_id: @queue["project_id"], account_id: @queue["account_id"])
     @status = { "schema" => "adventurefinder-chat-capture-status/v0.3", "project_id" => @queue["project_id"],
-      "account_id" => @queue["account_id"], "queue_sha256" => @queue["sha256"], "completed" => {}, "ingested" => {} }
+      "account_id" => @queue["account_id"], "queue_sha256" => @queue["sha256"],
+      "freshness_tolerance_seconds" => SnapshotArchive::FRESHNESS_TOLERANCE_SECONDS, "completed" => {}, "ingested" => {} }
     # Old completion entries and raw-only files never authorize success. Complete
     # journal entries can repair an interrupted derived index/checkpoint.
     @queue["pending"].each do |entry|
@@ -129,18 +130,18 @@ class CaptureWatch
     verified = SnapshotArchive.verify!(JSON.parse(File.binread(state_path!("capture_status.json"))))
     raise CaptureWatchError, "checkpoint verification failed" unless verified["ingested"][id] == current
     File.delete(path)
-    puts "Ingested #{id} version #{current["version"]} (#{current["freshness"]})"
+    puts "Ingested #{id} version #{current["version"]} (#{@archive.capture_freshness(current)})"
     current
   end
 
-  # Record complete content separately from freshness; unresolved captures are
-  # ingested evidence, never marked complete against a listing.
+  # Record checked content separately from freshness under the current tolerance.
+  # Historical receipt bytes stay intact; only matching exact listing updates
+  # with accepted freshness enter the derived completion checkpoint.
   def record_status(id, current)
     @status["ingested"][id] = current
     @status["completed"].delete(id)
     entry = @queue["pending"].find { |candidate| candidate["id"] == id }
-    if current["freshness"] == "verified-as-listed" && entry.dig("listing", "update_time_status") == "valid" &&
-        entry.dig("listing", "update_time") == current.dig("listing", "update_time")
+    if @archive.verified_unchanged?(current, entry.fetch("listing"))
       @status["completed"][id] = current
     end
   end
