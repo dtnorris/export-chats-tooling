@@ -204,8 +204,8 @@ class ExportReconciler
     if inventory["schema"] == "adventurefinder-chat-project-inventory/v0.2"
       archive = SnapshotArchive.new(root: data_repo, project_id: project_id, account_id: inventory["account_id"])
       pending, freshness_states = archive.select(records.sort_by { |record| record.fetch("id") }, completed_ids.keys)
-      completed_ids = freshness_states.select { |entry| entry["state"] == "verified-unchanged" }.to_h { |entry| [entry["id"], true] }
-      completed = freshness_states.select { |entry| entry["state"] == "verified-unchanged" }
+      completed_ids = freshness_states.select { |entry| entry["captured_for_listing"] }.to_h { |entry| [entry["id"], true] }
+      completed = freshness_states.select { |entry| entry["captured_for_listing"] }
     else
       completed_ids = {}
       completed = []
@@ -254,10 +254,11 @@ class ExportReconciler
       "archived_conversation_count" => freshness_states.count { |entry| entry["current"] },
       "archived_unresolved_count" => freshness_states.count { |entry| entry["freshness"] == "unresolved" },
       "freshness_tolerance_seconds" => SnapshotArchive::FRESHNESS_TOLERANCE_SECONDS,
+      "freshness_verified_count" => freshness_states.count { |entry| entry["captured_for_listing"] && entry["freshness"] == "verified-as-listed" },
       "completed" => completed,
       "legacy_evidence" => legacy_evidence,
       "freshness" => freshness_states,
-      "unknown_or_unresolved_count" => freshness_states.count { |entry| entry["state"] != "verified-unchanged" && !entry["selected"] },
+      "unknown_or_unresolved_count" => freshness_states.count { |entry| !entry["captured_for_listing"] && !entry["selected"] },
       "unresolved_markdown_payloads" => unresolved.map { |payload| unresolved_report(payload, title_index) }
     }
 
@@ -612,14 +613,15 @@ class ExportReconciler
     puts "Known inventory:   #{report.fetch("inventory_count")} conversations (#{report.fetch("inventory_coverage")})"
     puts "Existing payloads: #{report.fetch("unique_markdown_payload_count")} unique Markdown payloads"
     puts "Snapshot archives: #{report.fetch("archived_conversation_count")} (#{report.fetch("archived_unresolved_count")} unresolved freshness)"
-    puts "Freshness verified: #{report.fetch("completed_conversation_count")}"
-    puts "Freshness tolerance: #{report.fetch("freshness_tolerance_seconds")} second (listing change detection remains exact)"
+    puts "Capture complete:  #{report.fetch("completed_conversation_count")} for current listing revisions"
+    puts "Freshness agreement: #{report.fetch("freshness_verified_count")} (diagnostic only)"
+    puts "Freshness tolerance: #{report.fetch("freshness_tolerance_seconds")} seconds (1 hour; listing change detection remains exact)"
     puts "Pending IDs:       #{report.fetch("pending_conversation_count")}"
     puts "Unknown/deferred:  #{report.fetch("unknown_or_unresolved_count", 0)} (inspect freshness states; zero pending need not mean current)"
     puts "Legacy inventory cannot authorize capture; establish a matching ECT-01 v0.2 inventory." if report["inventory_coverage"] == "legacy-unverified"
     puts "Counts cover known IDs only; completion does not establish discovery or content freshness."
     puts "Unresolved files:  #{report.fetch("unresolved_markdown_payloads").length} payloads"
-    puts "Unresolved freshness means archived content with unconfirmed listing agreement, not failed ingestion."
+    puts "Timestamp disagreement is diagnostic, not failed ingestion or pending capture."
     puts "Unresolved files are unmatched legacy root Markdown (including Codex); this is not a missing-chat count."
     pending_reasons = report.fetch("freshness").select { |entry| entry["selected"] }.group_by { |entry| entry["state"] }
     puts "Queue reasons:    #{pending_reasons.map { |reason, entries| "#{reason}=#{entries.length}" }.join(', ')}"

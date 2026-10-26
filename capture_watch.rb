@@ -130,18 +130,18 @@ class CaptureWatch
     verified = SnapshotArchive.verify!(JSON.parse(File.binread(state_path!("capture_status.json"))))
     raise CaptureWatchError, "checkpoint verification failed" unless verified["ingested"][id] == current
     File.delete(path)
-    puts "Ingested #{id} version #{current["version"]} (#{@archive.capture_freshness(current)})"
+    puts "Ingested #{id} version #{current["version"]} (capture complete; timestamp agreement: #{@archive.capture_freshness(current)})"
     current
   end
 
   # Record checked content separately from freshness under the current tolerance.
-  # Historical receipt bytes stay intact; only matching exact listing updates
-  # with accepted freshness enter the derived completion checkpoint.
+  # Historical receipt bytes stay intact; successful captures of the exact listing
+  # revision enter completion even when timestamp agreement is unresolved.
   def record_status(id, current)
     @status["ingested"][id] = current
     @status["completed"].delete(id)
     entry = @queue["pending"].find { |candidate| candidate["id"] == id }
-    if @archive.verified_unchanged?(current, entry.fetch("listing"))
+    if @archive.captured_unchanged?(current, entry.fetch("listing"))
       @status["completed"][id] = current
     end
   end

@@ -53,24 +53,30 @@ unknown until captured through a ten-ID bootstrap lane. See the
 [update/version contract](AUTOMATED_EXPORT.md#daily-update-selection-and-unknown-freshness)
 for coverage, digest scope, races, bounded recovery and current/older-version lookup.
 
-An `Ingested ... (unresolved)` message means the content was archived successfully,
-but freshness could not be established against the project listing. Valid listing
-and fetched timestamps may differ by **up to one second, inclusive**, in either
-direction. Neither may be later than request start. Full timestamps remain intact;
-even a one-millisecond change to a listing's update time still queues inspection.
-The summary
-reports **snapshot archives** separately from **freshness verified** IDs. A new
-scan does not reset the two-attempt retry limit for unchanged listing fields.
-New conversations and first inspections of changed listings run before the bounded
-historical recovery lane, newest updates first; that lane may still deliberately
-select old chats.
+A successful validated capture completes inspection of its exact listing revision,
+independent of timestamp agreement. Reconciliation reports **Capture complete**
+separately from **Freshness agreement**. A changed listing revision (identity,
+title, creation/update values or statuses) triggers inspection again; scan/audit
+provenance alone does not. This assumes listing changes expose content changes.
 
-Rerun reconciliation after upgrading to reassess existing complete captures with
-this tolerance; no inventory sweep or recapture is required for that reassessment.
-Historical observation receipts retain their original schema and freshness value.
-The per-ID report's `freshness` field shows today's evaluation; its `current` field
-contains the unchanged historical receipt. Raw-only/legacy files without a checked
-snapshot still require the existing bootstrap workflow.
+Listing and fetched timestamps may differ by **up to one hour (3600 seconds),
+inclusive**, in either direction for freshness agreement. Neither may be later
+than request start. Larger gaps and unusable source times remain diagnostic
+uncertainty, not failed ingestion or automatic retries. Exact listing-change
+detection is unchanged. Successfully captured IDs no longer consume historical
+recovery slots; up to ten uncaptured legacy/incomplete IDs continue per run,
+after new and changed listings. Reconcile again after draining each queue.
+
+Rerun reconciliation after upgrading to reassess complete existing captures;
+no archive migration, inventory sweep or recapture is required. New observation
+receipts use v3; v1/v2 receipts retain their original exact/one-second validation
+policies and bytes, including replay. Mixed journals are supported; retain the
+upgraded tooling for reading new receipts. Today's `freshness` diagnostic may
+therefore differ from the immutable nested `current` receipt.
+
+Capture completion is not proof of source freshness, discovery completeness,
+or original media download. Inspect remaining pending/deferred captures and
+discovery coverage separately. Raw-only/legacy files still need checked captures.
 
 ### Repository Components
 

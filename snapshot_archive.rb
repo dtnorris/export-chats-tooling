@@ -20,8 +20,9 @@ end
 class SnapshotArchive
   SCHEMA = "chat-snapshot/v1"
   LEGACY_OBSERVATION_SCHEMA = "chat-observation/v1"
-  OBSERVATION_SCHEMA = "chat-observation/v2"
-  FRESHNESS_TOLERANCE_SECONDS = 1
+  PREVIOUS_OBSERVATION_SCHEMA = "chat-observation/v2"
+  OBSERVATION_SCHEMA = "chat-observation/v3"
+  FRESHNESS_TOLERANCE_SECONDS = 3600
   QUEUE_SCHEMA = "adventurefinder-chat-pending-queue/v0.2"
   CAPTURE_SCHEMA = "adventurefinder-chat-download-capture/v0.2"
   RENDERER = "active-branch/v1"
@@ -220,7 +221,7 @@ class SnapshotArchive
     Dir.children(directory).grep(/\A[0-9a-f]{64}\z/).each { |version| version!(id, version) }
     receipts = Dir.glob(path!("versions/#{id}/observations/*.json")).map do |path|
       receipt = self.class.verify!(self.class.parse(File.binread(path!(path.delete_prefix(@root + "/")))))
-      raise SnapshotArchiveError, "observation binding mismatch" unless [LEGACY_OBSERVATION_SCHEMA, OBSERVATION_SCHEMA].include?(receipt["schema"]) &&
+      raise SnapshotArchiveError, "observation binding mismatch" unless [LEGACY_OBSERVATION_SCHEMA, PREVIOUS_OBSERVATION_SCHEMA, OBSERVATION_SCHEMA].include?(receipt["schema"]) &&
         receipt["project_id"] == @project_id && receipt["account_id"] == @account_id && receipt["conversation_id"] == id &&
         /\A[0-9a-f]{64}\z/.match?(receipt["package_sha256"].to_s) && File.basename(path) == "#{receipt["package_sha256"]}.json"
       %w[request_started_at captured_at].each { |field| self.class.time!(receipt[field]) }
@@ -261,12 +262,14 @@ class SnapshotArchive
   end
 
   # Compare validated listing/fetched timestamps without rounding or changing them.
-  # v1 receipts require equality; v2 accepts an inclusive one-second difference.
+  # Historical v1/v2 receipts retain equality/one-second policies; new v3
+  # receipts accept an inclusive one-hour difference.
   # Neither source time may exceed request start. Returns a freshness String;
   # raises SnapshotArchiveError for unknown policies; timestamp parsing errors propagate.
   def freshness(listing, fetched, started, schema: OBSERVATION_SCHEMA)
     tolerance = case schema
     when LEGACY_OBSERVATION_SCHEMA then 0
+    when PREVIOUS_OBSERVATION_SCHEMA then 1
     when OBSERVATION_SCHEMA then FRESHNESS_TOLERANCE_SECONDS
     else raise SnapshotArchiveError, "unsupported observation freshness policy"
     end
@@ -287,26 +290,24 @@ class SnapshotArchive
       receipt.fetch("request_started_at"))
   end
 
-  # Return whether a checked capture matches an unchanged exact listing update.
-  # Tolerance applies only inside the capture; even a 1 ms listing change must
-  # request inspection. Accept nil current evidence; malformed inputs raise.
-  def verified_unchanged?(current, listing)
-    current && listing["update_time_status"] == "valid" &&
-      current.dig("listing", "update_time") == listing["update_time"] &&
-      capture_freshness(current) == "verified-as-listed"
-  end
-
-  # Return the content-relevant listing fields for retry accounting. Scan/audit
+  # Return the content-relevant listing fields for inspection completion. Scan/audit
   # provenance is retained in receipts but must not make unchanged content new.
   # Accept a validated listing Hash and return its stable revision fields.
   def listing_revision(listing)
     listing.slice("id", "title", "create_time", "create_time_status", "update_time", "update_time_status")
   end
 
-  # Select new/updated IDs and at most ten unknown/retry captures. A disagreement
-  # gets at most two attempts per listing revision. Missing dates use a bounded audit
-  # lane, never daily history refetch. Queue current work first, newest update
-  # first within each lane. Returns [pending, per-ID evidence states].
+  # Return whether a validated complete capture inspected this exact listing
+  # revision, independent of timestamp agreement. Accept nil current evidence;
+  # callers must use current! first so corrupt/incomplete bundles fail closed.
+  def captured_unchanged?(current, listing)
+    current && listing_revision(current.fetch("listing")) == listing_revision(listing)
+  end
+
+  # Select new/changed listings and at most ten uncaptured historical IDs.
+  # Successful captures satisfy their exact listing revision, even with unresolved
+  # timestamps. Scan/audit provenance alone cannot queue them again.
+  # Returns [pending, per-ID evidence states]; corrupt archive evidence raises.
   def select(records, legacy_ids)
     recovery_count = 0
     states = records.to_h do |record|
@@ -314,31 +315,24 @@ class SnapshotArchive
       receipts = observations(id)
       latest = current!(id)
       evaluated_freshness = latest && capture_freshness(latest)
-      verified = verified_unchanged?(latest, record)
-      revision = listing_revision(record)
-      same_revision = receipts.select { |receipt| listing_revision(receipt["listing"]) == revision }
-      reason = if verified
-        "verified-unchanged"
+      captured = !!captured_unchanged?(latest, record)
+      reason = if captured
+        evaluated_freshness == "verified-as-listed" ? "verified-unchanged" : "captured-unchanged"
       elsif latest.nil? && !receipts.empty?
         "incomplete"
       elsif latest.nil?
         legacy_ids.include?(id) ? "unknown-legacy" : "new"
-      elsif record["update_time_status"] != "valid"
-        latest.dig("listing", "last_full_audit_at") == record["last_full_audit_at"] ? "unknown-wait-audit" : "unknown-audit"
-      elsif same_revision.length >= 2
-        "unresolved-wait-inventory"
       else
         "updated"
       end
-      candidate = %w[new updated incomplete unknown-legacy unknown-audit].include?(reason)
-      recovery = reason.start_with?("unknown") || reason == "incomplete" ||
-        (latest && evaluated_freshness == "unresolved" && !same_revision.empty?)
+      candidate = %w[new updated incomplete unknown-legacy].include?(reason)
+      recovery = reason == "unknown-legacy" || reason == "incomplete"
       if candidate && recovery
         recovery_count += 1
         candidate = false if recovery_count > RECOVERY_LIMIT
       end
-      [id, { "id" => id, "state" => reason, "selected" => candidate, "recovery" => !!recovery,
-        "freshness" => evaluated_freshness, "current" => latest }]
+      [id, { "id" => id, "state" => reason, "selected" => candidate, "recovery" => recovery,
+        "captured_for_listing" => captured, "freshness" => evaluated_freshness, "current" => latest }]
     end
     pending = records.select { |record| states.fetch(record["id"])["selected"] }
       .sort do |left, right|

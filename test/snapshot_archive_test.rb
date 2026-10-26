@@ -132,13 +132,13 @@ class SnapshotArchiveTest < Minitest::Test
     text
   end
 
-  # The inclusive tolerance crosses second boundaries without accepting >1 second,
+  # The inclusive tolerance crosses second boundaries without accepting >1 hour,
   # missing/invalid evidence, or either source timestamp after request start.
-  def test_one_second_freshness_boundaries_and_clock_guards
+  def test_one_hour_freshness_boundaries_and_clock_guards
     listing = inventory.fetch("conversations").first
-    [-1000, -999, -155, 0, 155, 999, 1000, -1001, 1001, 60_000].each do |offset|
+    [-3_600_001, -3_600_000, -3_599_999, -155, 0, 155, 60_000, 3_599_999, 3_600_000, 3_600_001].each do |offset|
       fetched = { status: "valid", value: (Time.iso8601(UPDATE) + Rational(offset, 1000)).iso8601(3) }
-      expected = offset.abs <= 1000 ? "verified-as-listed" : "unresolved"
+      expected = offset.abs <= 3_600_000 ? "verified-as-listed" : "unresolved"
       assert_equal expected, @archive.freshness(listing, fetched, CAPTURE), offset.inspect
     end
     crossing = listing.merge("update_time" => "2026-10-09T11:59:59.999Z")
@@ -166,7 +166,7 @@ class SnapshotArchiveTest < Minitest::Test
     assert_nil downloaded["error"]
     refute File.exist?(watch(downloaded["downloads"].fetch(0).fetch("text")))
     current = @archive.current!("old-chat")
-    assert_equal "chat-observation/v2", current["schema"]
+    assert_equal "chat-observation/v3", current["schema"]
     assert_equal "verified-as-listed", current["freshness"]
     assert read_json(File.join(@state, "capture_status.json"))["completed"].key?("old-chat")
     repeated, report = reconcile(inventory(rows))
@@ -204,7 +204,7 @@ class SnapshotArchiveTest < Minitest::Test
     mixed = JSON.generate(package(queue, raw(text: "New content", update: "2026-10-09T12:00:00.155Z"),
       started: "2026-10-13T12:00:00.000Z"))
     watch(mixed)
-    assert_equal %w[chat-observation/v1 chat-observation/v2], @archive.observations("old-chat").map { |receipt| receipt["schema"] }
+    assert_equal %w[chat-observation/v1 chat-observation/v3], @archive.observations("old-chat").map { |receipt| receipt["schema"] }
     assert_equal original_receipt, File.binread(receipt_path)
   end
 
@@ -212,10 +212,10 @@ class SnapshotArchiveTest < Minitest::Test
   # v1 freshness claim or an unknown observation schema cannot bypass validation.
   def test_legacy_strict_validation_and_unknown_policy_fail_closed
     queue, = reconcile
-    legacy_capture(queue, raw(update: "2026-10-09T12:00:01.001Z"))
+    legacy_capture(queue, raw(update: "2026-10-09T13:00:00.001Z"))
     pending, report = reconcile
-    assert_equal ["old-chat"], pending["pending"].map { |entry| entry["id"] }
-    assert_equal 0, report["completed_conversation_count"]
+    assert_empty pending["pending"]
+    assert_equal 1, report["completed_conversation_count"]
     assert_equal 1, report["archived_unresolved_count"]
     current = @archive.current!("old-chat")
     path = File.join(@data, "versions", "old-chat", "observations", current["package_sha256"] + ".json")
@@ -223,6 +223,54 @@ class SnapshotArchiveTest < Minitest::Test
       File.binwrite(path, JSON.pretty_generate(SnapshotArchive.seal(forged)))
       assert_raises(SnapshotArchiveError) { @archive.current!("old-chat") }
     end
+  end
+
+  # A >hour mismatch completes one exact listing, leaving all recovery slots for
+  # uncaptured history. Changed title/update fields still trigger inspection.
+  def test_completed_mismatch_advances_legacy_backlog_and_reports_diagnostics
+    queue, = reconcile
+    original = package(queue, raw(update: "2026-08-16T01:05:46.327Z"))
+    text = JSON.generate(original)
+    watch(text)
+    before = files
+    legacy = 12.times.map { |index| row("legacy-#{index}") }
+    legacy.each { |entry| File.binwrite(File.join(@data, "2020-01-01 - #{entry['title']}.md"), "Legacy #{entry['id']}") }
+    queue, report = reconcile(inventory([row] + legacy))
+    assert_equal 10, queue["pending"].length
+    refute_includes queue["pending"].map { |entry| entry["id"] }, "old-chat"
+    assert_equal 1, report["completed_conversation_count"]
+    assert_equal 0, report["freshness_verified_count"]
+    assert_equal 1, report["archived_unresolved_count"]
+    before.reject { |path, _| path.end_with?("Project Inventory.json") }.each { |path, hash| assert_equal hash, files[path] }
+    queue["pending"].each { |entry| @archive.ingest(JSON.generate(package(queue, raw(entry["id"]))), queue) }
+    remaining, report = reconcile(inventory([row] + legacy))
+    assert_equal 2, remaining["pending"].length
+    assert_equal 11, report["completed_conversation_count"]
+    changed = row.merge("title" => "Renamed")
+    assert_equal ["old-chat"], reconcile(inventory([changed])).first["pending"].map { |entry| entry["id"] }
+  end
+
+  # Existing v2 receipts validate under their original one-second policy, while
+  # today's diagnostic uses one hour. Replays preserve every historical byte.
+  def test_v2_receipt_policy_is_preserved_and_reassessed_without_recapture
+    queue, = reconcile
+    text = JSON.generate(package(queue, raw(update: "2026-10-09T12:00:05.000Z")))
+    current = @archive.ingest(text, queue)
+    old = SnapshotArchive.seal(current.merge("schema" => "chat-observation/v2", "freshness" => "unresolved"))
+    base = File.join(@data, "versions", "old-chat")
+    [File.join(base, "current.json"), File.join(base, "observations", old["package_sha256"] + ".json")].each do |path|
+      File.binwrite(path, JSON.pretty_generate(old) + "\n")
+    end
+    before = files
+    pending, report = reconcile
+    assert_empty pending["pending"]
+    assert_equal 1, report["freshness_verified_count"]
+    assert_equal "unresolved", @archive.current!("old-chat")["freshness"]
+    @archive.ingest(text, queue)
+    assert_equal before, files
+    forged = SnapshotArchive.seal(old.merge("freshness" => "verified-as-listed"))
+    File.binwrite(File.join(base, "observations", old["package_sha256"] + ".json"), JSON.pretty_generate(forged))
+    assert_raises(SnapshotArchiveError) { @archive.current!("old-chat") }
   end
 
   # Hash every existing archive file, preserving paths as well as bytes.
@@ -358,7 +406,7 @@ class SnapshotArchiveTest < Minitest::Test
   end
 
   # Advancing listing metadata alone cannot create versions or freshness evidence.
-  def test_listing_advance_race_bounded_retry_and_future_reselection
+  def test_listing_advance_capture_completion_and_future_reselection
     queue, = reconcile
     @archive.ingest(JSON.generate(package(queue)), queue)
     advanced = "2026-10-11T00:00:00.000Z"
@@ -367,14 +415,14 @@ class SnapshotArchiveTest < Minitest::Test
     2.times do |index|
       text = JSON.generate(package(queue, started: "2026-10-1#{2 + index}T12:00:00.000Z"))
       @archive.ingest(text, queue)
-      @archive.ingest(text, queue) # Exact replay does not consume a retry or version.
+      @archive.ingest(text, queue) # Exact replay does not create another version.
     end
     assert_equal 1, versions.length
     assert_equal "unresolved", @archive.current!("old-chat")["freshness"]
     pending, report = reconcile(inventory([row(update: advanced)], scan: scan))
     assert_empty pending["pending"]
-    assert_equal "unresolved-wait-inventory", report["freshness"].first["state"]
-    assert_equal 1, report["unknown_or_unresolved_count"]
+    assert_equal "captured-unchanged", report["freshness"].first["state"]
+    assert_equal 0, report["unknown_or_unresolved_count"]
     future, = reconcile(inventory([row(update: "2026-10-13T00:00:00.000Z")], scan: "2026-10-14T00:00:00.000Z"))
     assert_equal ["old-chat"], future["pending"].map { |entry| entry["id"] }
     changed = raw(update: "2026-10-13T00:00:00.000Z", text: "Caught up")
@@ -382,21 +430,21 @@ class SnapshotArchiveTest < Minitest::Test
     assert_equal "verified-as-listed", @archive.current!("old-chat")["freshness"]
   end
 
-  # Daily/full-audit provenance changes must not reset two attempts for the same
+  # Daily/full-audit provenance changes do not refetch a successfully captured
   # listing revision. Real update/title changes remain eligible for inspection.
-  def test_unchanged_listing_rescans_do_not_reset_retry_budget
+  def test_unchanged_listing_rescans_do_not_refetch_timestamp_disagreements
     queue, = reconcile
-    mismatched = raw(update: "2026-10-09T12:00:03.000Z")
+    mismatched = raw(update: "2026-10-09T13:00:03.000Z")
     2.times do |index|
       @archive.ingest(JSON.generate(package(queue, mismatched,
         started: "2026-10-1#{2 + index}T12:00:00.000Z")), queue)
     end
     future, report = reconcile(inventory(scan: "2026-10-14T00:00:00.000Z"))
     assert_empty future["pending"]
-    assert_equal "unresolved-wait-inventory", report["freshness"].first["state"]
+    assert_equal "captured-unchanged", report["freshness"].first["state"]
     assert_equal 1, report["archived_conversation_count"]
     assert_equal 1, report["archived_unresolved_count"]
-    assert_equal 0, report["completed_conversation_count"]
+    assert_equal 1, report["completed_conversation_count"]
     changed, = reconcile(inventory([row(update: "2026-10-13T00:00:00.000Z")],
       scan: "2026-10-14T00:00:00.000Z"))
     assert_equal ["old-chat"], changed["pending"].map { |entry| entry["id"] }
@@ -430,7 +478,7 @@ class SnapshotArchiveTest < Minitest::Test
     assert_equal "verified-as-listed", @archive.current!(target)["freshness"]
   end
 
-  # A fetch racing ahead of listing is retained but cannot advance freshness.
+  # A fetch racing ahead of listing completes capture but cannot claim freshness.
   def test_newer_fetched_timestamp_is_not_a_verified_listing
     queue, = reconcile
     changed = raw(update: "2026-10-12T12:00:01.000Z", text: "Racing update")
@@ -438,8 +486,8 @@ class SnapshotArchiveTest < Minitest::Test
     current = @archive.current!("old-chat")
     assert_equal "unresolved", current["freshness"]
     assert_equal changed["update_time"], current.dig("fetched_update", "value")
-    assert_empty read_json(File.join(@state, "capture_status.json"))["completed"]
-    refute_empty reconcile.first["pending"]
+    assert read_json(File.join(@state, "capture_status.json"))["completed"].key?("old-chat")
+    assert_empty reconcile.first["pending"]
   end
 
   # Canonical lookup uses capture order, supporting equal/backdated source times
@@ -528,7 +576,7 @@ class SnapshotArchiveTest < Minitest::Test
     assert_equal original, files.reject { |name, _| name.end_with?("Project Inventory.json") }
   end
 
-  # Missing/invalid source times remain explicit and recheck only on later audits.
+  # Missing/invalid source times remain explicit without refetch on later audits.
   def test_unusable_source_times_do_not_refetch_daily
     [nil, "invalid"].each do |update|
       FileUtils.rm_rf(File.join(@data, "versions"))
@@ -536,10 +584,10 @@ class SnapshotArchiveTest < Minitest::Test
       @archive.ingest(JSON.generate(package(queue, raw(update: update))), queue)
       pending, report = reconcile(inventory([row(update: update)]))
       assert_empty pending["pending"]
-      assert_equal "unknown-wait-audit", report["freshness"].first["state"]
+      assert_equal "captured-unchanged", report["freshness"].first["state"]
+      queue, = reconcile(inventory([row(update: update)], scan: "2026-10-14T00:00:00.000Z"))
+      assert_empty queue["pending"]
     end
-    queue, = reconcile(inventory([row(update: nil)], scan: "2026-10-14T00:00:00.000Z"))
-    assert_equal "unknown-audit", queue["pending"].first["reason"]
   end
 
   # Reject bad capture metadata/identity/hashes before any archive mutation.

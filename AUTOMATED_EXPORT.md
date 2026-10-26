@@ -215,67 +215,51 @@ capture: first establish an exhaustive v0.2 baseline. Reconciliation generates a
 checksummed v0.2 queue with the inventory checksum, exact inventory-file SHA-256,
 scan/audit provenance and each selected cumulative listing record.
 
-`reconciliation.json` separates `legacy_evidence` from verified `completed` and
-per-ID `freshness` states. `archived_conversation_count` counts verified complete
-snapshot bundles regardless of timestamp agreement; `archived_unresolved_count`
-counts the subset unresolved under the current tolerance. These are distinct from freshness
-completion. `unresolved_markdown_payloads` concerns legacy root-file matching
-(including Codex sessions), not the number of conversations missing content.
-An old creation date does not suppress a recent update.
-`new` identifies IDs without historical matching or a verified snapshot. `updated`
-means the latest listing differs from captured evidence or freshness is unresolved.
-`verified-unchanged` skips capture when a checked capture's valid listing and fetched
-update times differ by at most **one second, inclusive**, in either direction, and
-the current listing update time still matches the captured listing **exactly**.
-Neither update timestamp may be later than request start. Tolerance is applied
-only to freshness agreement, using exact rational seconds without rounding;
-inventories, watermarks, revision keys, source timestamps and content digests
-are unchanged. Timestamp normalization is unchanged. A one-millisecond listing
-change still requests inspection.
-This assumes the provider changes update time when content changes; equal-time
-provider changes cannot be discovered from timestamps alone.
+`reconciliation.json` separates legacy evidence, successful capture completion,
+and timestamp agreement. `completed` / `completed_conversation_count` and
+`completed_ids.json` now mean a validated complete capture inspected the exact
+current listing revision. `freshness_verified_count` counts the completed subset
+with timestamp agreement. `archived_conversation_count` counts complete archived
+IDs even when a changed listing still needs inspection; `archived_unresolved_count`
+counts archived IDs with timestamp disagreement under today's policy. Unmatched
+root Markdown (including Codex) is not a missing-chat count.
 
-Legacy Markdown matches, raw-only files and old `.state` completion entries have
-**unknown freshness**, irrespective of filename, date or modification time. They
-are never promoted into version metadata or assigned invented capture dates.
-At most **ten** unknown/bootstrap/recovery IDs are selected per reconciliation,
-in full-ID lexical order. Further IDs remain explicitly deferred; rerun after
-draining the selected queue to progress through a large legacy archive. This is
-an operator-driven bootstrap, not a daily full-history capture. Genuinely new IDs
-and first inspections of changed listings do not use this ten-ID budget, including
-when the previous capture was unresolved. They precede recovery entries in the
-browser queue, with newest updates first within each lane.
+New and changed listings are fetched first. The listing revision includes ID,
+title, creation/update values and timestamp statuses, excluding scan/audit lineage.
+Even a one-millisecond update change requests inspection. A successful capture
+satisfies that revision: `verified-unchanged` with timestamp agreement, otherwise
+`captured-unchanged`. Neither is automatically retried or charged to historical
+recovery. A later listing revision queues inspection again. Equal-revision provider
+content changes cannot be discovered from listing evidence alone.
 
-A valid but disagreeing listing/fetch pair gets at most **two distinct captured
-attempts per stable listing revision**: identity, title, creation/update values
-and their statuses. Exact download replay consumes no extra attempt. Scan flags,
-observation times and audit lineage remain in immutable receipts but do not reset
-this limit. Afterward it remains `unresolved-wait-inventory`; changed listing
-fields allow a new inspection. Missing/invalid source update times remain
-unresolved and use `unknown-wait-audit` after a capture, with at most ten selected
-on a later full audit (`unknown-audit`). There is no per-day refetch of every old
-chat. Zero pending may coexist with unknown/deferred IDs: inspect the report.
-An absent ID in a partial listing never removes any archived file or observation.
+Up to ten uncaptured legacy/incomplete IDs are selected per reconciliation in
+full-ID lexical order. They follow new/changed listings; successful captures free
+those slots on the next run, even with missing/invalid or disagreeing timestamps.
+Failed/interrupted captures remain outstanding. Legacy Markdown, raw-only files,
+old checkpoint entries and unverified partial bundles never prove completion.
+Unknown/deferred counts exclude successful captures of unchanged revisions.
+Zero pending still does not establish exhaustive discovery or source freshness.
+Absent IDs in partial scans never cause deletion.
 
-Listing and conversation endpoints can report different update times. ISO input
-currently truncates sub-millisecond digits while numeric seconds round them, so
-even the same source instant can differ by one millisecond. New `chat-observation/v2`
-receipts record freshness using the one-second tolerance. Existing
-`chat-observation/v1` receipts continue to validate under their original exact
-comparison, including exact package replay. Mixed journals are supported; unknown
-schemas and falsified historical freshness fail closed. Tools predating v2 cannot
-read new v2 receipts; retain the upgraded tooling when using those captures.
+Timestamp agreement uses an absolute difference of at most **3600 seconds
+(one hour), inclusive**, without rounding into time buckets. Both valid source
+update times must be no later than request start. Larger differences, missing or
+invalid source times remain `unresolved` diagnostics. Completion does not assert
+that a possibly stale endpoint returned every latest message.
 
-Reconciliation and watcher completion also reassess checked historical receipts
-under the current tolerance without rewriting their bytes, checksum, original
-freshness or `current.json`. No recapture is needed for a qualifying v1 receipt.
-The report's per-ID `freshness` contains this current evaluation; nested `current`
-is the original receipt and may still say `unresolved`. The report/checkpoint's
-`freshness_tolerance_seconds` records the current rule. Missing/invalid timestamp
-evidence and differences greater than one second remain unresolved; raw-only
-legacy files are not promoted. The tolerance is a practical agreement policy,
-not proof of an atomic server snapshot or identical content within that interval.
-The bounded retry policy still prevents unlimited recapture of unchanged listings.
+New `chat-observation/v3` receipts record the one-hour policy. Historical v1
+receipts validate under exact equality, and v2 under their original one-second
+policy. Replays preserve receipt bytes; mixed journals are supported. Unknown
+schemas, forged freshness, corrupt hashes, identity conflicts and incomplete
+bundles still fail closed. Older tooling cannot read v3; retain upgraded tooling.
+
+Reconciliation and watcher diagnostics reassess historical receipts under today's
+one-hour tolerance without rewriting them or `current.json`. No recapture is
+needed. The report's per-ID `freshness` is the current evaluation; its nested
+`current` retains the historical schema/freshness. `freshness_tolerance_seconds`
+records the active diagnostic policy. Capture checkpoints count successful exact
+listing captures independently of that diagnostic. The watcher and reconciliation
+therefore agree about completion while preserving the original evidence.
 
 ### Version storage, digest and current lookup
 
