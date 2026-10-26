@@ -342,11 +342,10 @@ env -u CHAT_EXPORT_ONLY_LOCAL_DATE ruby reconcile_exports.rb /Users/davidnorris/
 ## 10/23 Notes (Tonight)
 1. caffeinate -dimsu
 2. delete window.__chatProjectInventoryExpectedCount; delete window.__chatProjectInventoryFullAudit;
-3. <move the downloads in export-chats-data>
-4. cd /Users/davidnorris/code/export-chats-tooling && pbcopy < .state/project_inventory_console.js
+3. cd /Users/davidnorris/code/export-chats-tooling && pbcopy < .state/project_inventory_console.js
+4. <move the downloads in export-chats-data>
 5. cd /Users/davidnorris/code/export-chats-tooling && env -u CHAT_EXPORT_ONLY_LOCAL_DATE ruby reconcile_exports.rb && /Users/davidnorris/code/export-chats-data && "/Users/davidnorris/code/export-chats-data/2026-10-23 - AdventureFinder Nightly Project Inventory.json"
 6. cd /Users/davidnorris/code/export-chats-tooling && ruby capture_watch.rb && /Users/davidnorris/code/export-chats-data && /Users/davidnorris/Downloads
 7. delete window.__chatProjectBatchLimit;
 8. cd /Users/davidnorris/code/export-chats-tooling && pbcopy < .state/project_batch_console.js
-
 9. <after> cd /Users/davidnorris/code/export-chats-tooling && env -u CHAT_EXPORT_ONLY_LOCAL_DATE ruby reconcile_exports.rb && /Users/davidnorris/code/export-chats-data && "/Users/davidnorris/code/export-chats-data/2026-10-23 - AdventureFinder Nightly Project Inventory.json"
