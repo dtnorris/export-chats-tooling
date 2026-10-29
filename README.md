@@ -302,6 +302,7 @@ and instructions for keeping projects separate.
     - Your archive directory (default: `/Users/davidnorris/code/export-chats-data`).
 
 4. Generate the current pending queue and browser exporter.
+    - In a terminal, reconciliation shows an updating progress bar on stderr for Markdown hashing/matching, legacy raw checks, and snapshot checks. Counts and elapsed seconds refer to each phase; the bar advances after an item finishes, so one large file or conversation can pause it. Inventory/report/write phases show a label. Progress is suppressed when stderr is redirected; stdout retains the existing summary. Progress does not change selection, validation, or archival behavior.
     - (This regenerates the next inventory console script and batch exporter. Review freshness states: Pending IDs: 0 can coexist with unknown/deferred IDs and does not establish unseen-record discovery.)
     - `cd /Users/davidnorris/code/export-chats-tooling && ruby reconcile_exports.rb`
 

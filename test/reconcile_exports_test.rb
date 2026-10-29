@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+require "minitest/mock"
 require "tmpdir"
 require "stringio"
 require "open3"
@@ -79,6 +80,133 @@ class ReconcileExportsTest < Minitest::Test
   # Read a generated state artifact, raising JSON/file errors if generation failed.
   def state(name)
     JSON.parse(File.binread(File.join(@state, name)))
+  end
+
+  # Return an in-memory terminal for deterministic rendering tests, without a PTY.
+  def terminal_output
+    StringIO.new.tap { |output| output.define_singleton_method(:tty?) { true } }
+  end
+
+  # Start immediately, throttle intermediate redraws, always display the final
+  # count and flush each frame. A fake clock avoids sleeps and timing assertions.
+  def test_terminal_progress_updates_counts_and_throttles_redraws
+    output = terminal_output
+    flushes = 0
+    output.define_singleton_method(:flush) { flushes += 1 }
+    now = 0.0
+    progress = ReconcileProgress.new(output: output, clock: -> { now })
+    progress.start("Checking snapshots", total: 3)
+    assert_includes output.string, "[--------------------] 0/3 (0.0s)"
+    assert_equal 1, flushes
+    initial = output.string.dup
+    progress.advance
+    assert_equal initial, output.string
+    now = 0.2
+    progress.advance
+    assert_includes output.string, "2/3 (0.2s)"
+    now = 0.21
+    progress.advance
+    assert_includes output.string, "[####################] 3/3"
+    progress.finish
+    assert output.string.end_with?("\n")
+    assert_equal 4, flushes
+  end
+
+  # Empty phases avoid division by zero; cleanup is idempotent and does not mark
+  # an unfinished phase complete after an error or interruption.
+  def test_empty_and_unfinished_progress_phases
+    output = terminal_output
+    progress = ReconcileProgress.new(output: output)
+    progress.start("Hashing Markdown", total: 0)
+    assert_includes output.string, "0/0"
+    progress.start("Checking snapshots", total: 2)
+    progress.advance
+    progress.finish
+    refute_includes output.string, "2/2"
+    assert output.string.end_with?("\n")
+    finished = output.string.dup
+    progress.finish
+    assert_equal finished, output.string
+  end
+
+  # Redirected output remains silent and never samples the progress clock.
+  def test_redirected_progress_is_silent
+    output = StringIO.new
+    progress = ReconcileProgress.new(output: output, clock: -> { flunk "disabled progress sampled clock" })
+    progress.start("Checking snapshots", total: 1)
+    progress.advance
+    progress.finish
+    assert_empty output.string
+  end
+
+  # The real reconciliation pipeline must produce byte-identical state and the
+  # same stdout/report with progress enabled, while leaving archive bytes intact.
+  def test_progress_preserves_reports_queues_summary_and_archive
+    path = File.join(@data, "Synthetic Project Inventory.json")
+    File.binwrite(path, JSON.generate(cumulative))
+    File.binwrite(File.join(@data, "2026-01-01 - current.md"), "Synthetic transcript")
+    FileUtils.mkdir_p(File.join(@data, "raw"))
+    File.binwrite(File.join(@data, "raw", "old-completed.json"), '{"id":"old-completed"}')
+    before = Dir.glob(File.join(@data, "**", "*")).select { |file| File.file?(file) }.to_h { |file| [file, File.binread(file)] }
+    output = terminal_output
+    first = second = nil
+    Time.stub(:now, Time.utc(2026, 10, 29)) do
+      first_stdout, first_stderr = capture_io do
+        first = ExportReconciler.new(data_repo: @data, inventory_path: path).run
+      end
+      state_bytes = Dir.glob(File.join(@state, "*")).to_h { |file| [file, File.binread(file)] }
+      second_stdout, second_stderr = capture_io do
+        second = ExportReconciler.new(data_repo: @data, inventory_path: path,
+          progress: ReconcileProgress.new(output: output)).run
+      end
+      assert_equal first_stdout, second_stdout
+      assert_empty first_stderr
+      assert_empty second_stderr
+      assert_equal first, second
+      assert_equal state_bytes, Dir.glob(File.join(@state, "*")).to_h { |file| [file, File.binread(file)] }
+    end
+    assert_equal before, Dir.glob(File.join(@data, "**", "*")).select { |file| File.file?(file) }.to_h { |file| [file, File.binread(file)] }
+    ["Reading inventory", "Hashing Markdown", "Matching Markdown", "Checking legacy raw", "Checking snapshots",
+      "Preparing reports", "Writing queues and runners", "3/3"].each { |text| assert_includes output.string, text }
+    assert output.string.end_with?("\n")
+  end
+
+  # Corrupt snapshot evidence still fails closed. Cleanup leaves an unfinished
+  # progress line terminated and preserves the previously generated state files.
+  def test_snapshot_failure_ends_progress_without_success_or_state_changes
+    reconcile(cumulative)
+    original = Dir.glob(File.join(@state, "*")).to_h { |file| [file, File.binread(file)] }
+    archive = SnapshotArchive.new(root: @data, project_id: "g-p-test", account_id: "account-test")
+    directory = File.join(@data, "versions", "current")
+    FileUtils.mkdir_p(directory)
+    File.binwrite(File.join(@data, "versions", "binding.json"), JSON.pretty_generate(archive.binding) + "\n")
+    File.binwrite(File.join(directory, "current.json"), "{}")
+    output = terminal_output
+    stdout, = capture_io do
+      assert_raises(SnapshotArchiveError) do
+        ExportReconciler.new(data_repo: @data,
+          progress: ReconcileProgress.new(output: output)).run
+      end
+    end
+    assert_empty stdout
+    assert_includes output.string, "Checking snapshots [--------------------] 0/3"
+    refute_includes output.string, "3/3"
+    assert output.string.end_with?("\n")
+    assert_equal original, Dir.glob(File.join(@state, "*")).to_h { |file| [file, File.binread(file)] }
+  end
+
+  # Ctrl-C propagates while the ensure clause terminates the active progress line.
+  def test_interrupt_ends_progress_and_propagates
+    reconcile(cumulative)
+    output = terminal_output
+    progress = ReconcileProgress.new(output: output)
+    reconciler = ExportReconciler.new(data_repo: @data, progress: progress)
+    reconciler.stub(:inventory_records, ->(_inventory) { raise Interrupt }) do
+      assert_raises(Interrupt) { reconciler.run }
+    end
+    assert_includes output.string, "Reading inventory"
+    assert output.string.end_with?("\n")
+    refute_includes output.string, "Writing queues"
   end
 
   # A scoped daily capture excludes old backlog without suppressing a current update.

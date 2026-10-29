@@ -113,6 +113,70 @@ end
 
 require_relative "snapshot_archive"
 
+# Terminal-only feedback for reconciliation phases. Counts are completed items in
+# the current phase, not a time estimate or proof that reconciliation succeeded.
+class ReconcileProgress
+  # Bind a writable terminal stream and monotonic seconds clock. No output yet;
+  # stream/clock errors propagate when rendering. Nonterminals remain silent.
+  def initialize(output: $stderr, clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) })
+    @output, @clock = output, clock
+    @enabled = output.tty?
+    @active = false
+  end
+
+  # End the previous line and immediately display a phase with optional item
+  # total. Accepts fixed internal labels and nonnegative totals; returns nil.
+  def start(label, total: nil)
+    return unless @enabled
+
+    finish
+    @label, @total, @completed = label, total, 0
+    @started_at = @clock.call
+    @width = 0
+    @active = true
+    render(@started_at)
+  end
+
+  # Count one successfully processed item. Refresh at most ten times per second,
+  # except the final count, which is always shown. Stream/clock errors propagate.
+  def advance
+    return unless @enabled && @active
+
+    @completed += 1
+    now = @clock.call
+    render(now) if @completed == @total || now - @rendered_at >= 0.1
+  end
+
+  # Terminate an active line on completion, failure or interruption without
+  # inventing completed work. Repeated calls/nonterminals do nothing; returns nil.
+  def finish
+    return unless @enabled && @active
+
+    @output.write("\n")
+    @output.flush
+    @active = false
+    nil
+  end
+
+  private
+
+  # Render completed counts and elapsed phase seconds in place, clearing any
+  # trailing old text. Accepts monotonic seconds; stream errors propagate.
+  def render(now)
+    count = if @total
+      filled = @total.zero? ? 20 : 20 * @completed / @total
+      " [#{'#' * filled}#{'-' * (20 - filled)}] #{@completed}/#{@total}"
+    else
+      ""
+    end
+    line = format("%s%s (%.1fs)", @label, count, now - @started_at)
+    @output.write("\r#{line}#{' ' * [@width - line.length, 0].max}")
+    @output.flush
+    @width, @rendered_at = line.length, now
+    nil
+  end
+end
+
 # Match known inventory IDs to archival evidence and write resumable queues.
 # Accepts explicit archive/inventory paths; raises ReconcileError on unsafe evidence.
 class ExportReconciler
@@ -120,7 +184,10 @@ class ExportReconciler
 
   attr_reader :data_repo, :inventory_path
 
-  def initialize(data_repo:, inventory_path: nil)
+  # Resolve existing archive/inventory paths and optional progress reporter.
+  # Does not write files; raises ReconcileError when required inputs are missing.
+  def initialize(data_repo:, inventory_path: nil, progress: ReconcileProgress.new)
+    @progress = progress
     @data_repo = File.expand_path(data_repo)
     raise ReconcileError, "data repo does not exist: #{@data_repo}" unless Dir.exist?(@data_repo)
 
@@ -131,6 +198,7 @@ class ExportReconciler
   # Read and validate the selected inventory, reconcile known IDs, then write local
   # queues/runners and return a report. Raises ReconcileError/JSON/file errors.
   def run
+    @progress.start("Reading inventory")
     inventory = JSON.parse(File.binread(inventory_path))
     project_id = inventory.fetch("project_id")
     records = inventory_records(inventory)
@@ -153,6 +221,7 @@ class ExportReconciler
     assignments = []
     unresolved = []
 
+    @progress.start("Matching Markdown", total: markdown_payloads.length)
     markdown_payloads.each do |payload|
       match = match_payload(payload, title_index)
       if match
@@ -160,6 +229,7 @@ class ExportReconciler
       else
         unresolved << payload
       end
+      @progress.advance
     end
 
     # A conversation ID may legitimately have multiple historical exports. Collapse
@@ -202,8 +272,11 @@ class ExportReconciler
     freshness_states = []
     legacy_evidence = completed
     if inventory["schema"] == "adventurefinder-chat-project-inventory/v0.2"
+      @progress.start("Checking snapshots", total: records.length)
       archive = SnapshotArchive.new(root: data_repo, project_id: project_id, account_id: inventory["account_id"])
-      pending, freshness_states = archive.select(records.sort_by { |record| record.fetch("id") }, completed_ids.keys)
+      pending, freshness_states = archive.select(records.sort_by { |record| record.fetch("id") }, completed_ids.keys) do
+        @progress.advance
+      end
       completed_ids = freshness_states.select { |entry| entry["captured_for_listing"] }.to_h { |entry| [entry["id"], true] }
       completed = freshness_states.select { |entry| entry["captured_for_listing"] }
     else
@@ -214,6 +287,7 @@ class ExportReconciler
         { "id" => record["id"], "state" => "unknown-legacy-inventory", "selected" => false, "current" => nil }
       end
     end
+    @progress.start("Preparing reports")
     local_date = ENV["CHAT_EXPORT_ONLY_LOCAL_DATE"]
     if local_date
       begin
@@ -294,6 +368,7 @@ class ExportReconciler
       SnapshotArchive.queue!(queue)
     end
 
+    @progress.start("Writing queues and runners")
     validate_state_paths!
     FileUtils.mkdir_p(STATE_DIR)
     ReconcileHelpers.atomic_json(File.join(STATE_DIR, "reconciliation.json"), report)
@@ -307,8 +382,11 @@ class ExportReconciler
     write_console_runner(queue)
     write_inventory_runner(inventory)
 
+    @progress.finish
     print_summary(report)
     report
+  ensure
+    @progress.finish
   end
 
   private
@@ -507,8 +585,11 @@ class ExportReconciler
   def unique_markdown_payloads
     groups = Hash.new { |hash, key| hash[key] = [] }
 
-    Dir.glob(File.join(data_repo, "*.md")).sort.each do |path|
+    paths = Dir.glob(File.join(data_repo, "*.md")).sort
+    @progress.start("Hashing Markdown", total: paths.length)
+    paths.each do |path|
       groups[ReconcileHelpers.sha256_file(path)] << path
+      @progress.advance
     end
 
     groups.map do |sha256, paths|
@@ -573,11 +654,13 @@ class ExportReconciler
   # complete ingestion. Raises on malformed JSON or conflicting embedded IDs.
   def raw_capture_ids(inventory_by_id)
     raw_dir = File.join(data_repo, "raw")
-    return [] unless Dir.exist?(raw_dir)
+    paths = Dir.glob(File.join(raw_dir, "*.json")).select do |path|
+      inventory_by_id.key?(File.basename(path, ".json"))
+    end
+    @progress.start("Checking legacy raw", total: paths.length)
 
-    Dir.glob(File.join(raw_dir, "*.json")).filter_map do |path|
+    paths.map do |path|
       id = File.basename(path, ".json")
-      next unless inventory_by_id.key?(id)
 
       begin
         raw = JSON.parse(File.binread(path))
@@ -590,6 +673,7 @@ class ExportReconciler
         raise ReconcileError, "raw capture ID mismatch in #{path}" if raw.key?(field) && raw[field] != id
       end
 
+      @progress.advance
       id
     end
   end

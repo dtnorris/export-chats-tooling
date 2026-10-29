@@ -307,6 +307,7 @@ class SnapshotArchive
   # Select new/changed listings and at most ten uncaptured historical IDs.
   # Successful captures satisfy their exact listing revision, even with unresolved
   # timestamps. Scan/audit provenance alone cannot queue them again.
+  # An optional block receives no arguments after each checked record, for progress.
   # Returns [pending, per-ID evidence states]; corrupt archive evidence raises.
   def select(records, legacy_ids)
     recovery_count = 0
@@ -331,6 +332,7 @@ class SnapshotArchive
         recovery_count += 1
         candidate = false if recovery_count > RECOVERY_LIMIT
       end
+      yield if block_given?
       [id, { "id" => id, "state" => reason, "selected" => candidate, "recovery" => recovery,
         "captured_for_listing" => captured, "freshness" => evaluated_freshness, "current" => latest }]
     end
