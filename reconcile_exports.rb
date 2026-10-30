@@ -273,7 +273,9 @@ class ExportReconciler
     legacy_evidence = completed
     if inventory["schema"] == "adventurefinder-chat-project-inventory/v0.2"
       @progress.start("Checking snapshots", total: records.length)
-      archive = SnapshotArchive.new(root: data_repo, project_id: project_id, account_id: inventory["account_id"])
+      cache_path = File.join(STATE_DIR, "snapshot_validation_cache.json") unless ENV["CHAT_EXPORT_FULL_VERIFY"] == "1"
+      archive = SnapshotArchive.new(root: data_repo, project_id: project_id, account_id: inventory["account_id"],
+        validation_cache_path: cache_path)
       pending, freshness_states = archive.select(records.sort_by { |record| record.fetch("id") }, completed_ids.keys) do
         @progress.advance
       end

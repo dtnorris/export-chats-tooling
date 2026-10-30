@@ -132,6 +132,394 @@ class SnapshotArchiveTest < Minitest::Test
     text
   end
 
+  # Enable semantic reuse only in this test's isolated tooling state directory.
+  # Returns an archive instance; archive/path errors propagate.
+  def cached_archive
+    SnapshotArchive.new(root: @data, project_id: "g-p-test", account_id: "account-test",
+      validation_cache_path: File.join(@state, "snapshot_validation_cache.json"))
+  end
+
+  # Install one valid capture and prime the cache; return queue and cached reader.
+  # Uses real ingestion/selection and propagates failures.
+  def prime_validation_cache
+    queue, = reconcile
+    @archive.ingest(JSON.generate(package(queue)), queue)
+    reader = cached_archive
+    reader.select(inventory.fetch("conversations"), [])
+    [queue, reader]
+  end
+
+  # Count actual full raw semantic validations during a caller operation.
+  # Returns [result, count]; validation exceptions propagate.
+  def count_raw_validation
+    count = 0
+    trace = TracePoint.new(:call) do |event|
+      count += 1 if event.defined_class == SnapshotArchive && event.method_id == :raw_semantics!
+    end
+    result = trace.enable { yield }
+    [result, count]
+  end
+
+  # Replace equal-length fixture bytes and restore timestamps, even on failure.
+  # Yields mutated bytes; all filesystem/caller errors propagate after restoration.
+  def with_same_length_corruption(path)
+    original = File.binread(path)
+    stat = File.stat(path)
+    changed = original.sub("Hello", "Jello")
+    raise "fixture missing corruption marker" if changed == original
+    File.binwrite(path, changed)
+    File.utime(stat.atime, stat.mtime, path)
+    yield changed
+  ensure
+    if original && stat
+      File.binwrite(path, original)
+      File.utime(stat.atime, stat.mtime, path)
+    end
+  end
+
+  # Fresh operations hash every raw/Markdown and reread all historical evidence,
+  # while successful unchanged content does no full raw semantic work.
+  def test_cache_warm_reads_and_hashes_authoritative_files
+    _, reader = prime_validation_cache
+    original_read = File.method(:binread)
+    original_hash = Digest::SHA256.method(:hexdigest)
+    reads, hashes = [], []
+    result = count = nil
+    File.stub(:binread, ->(path, *args) { reads << path; original_read.call(path, *args) }) do
+      Digest::SHA256.stub(:hexdigest, ->(text) { hashes << text; original_hash.call(text) }) do
+        result, count = count_raw_validation { reader.select(inventory.fetch("conversations"), []) }
+      end
+    end
+    assert_equal 0, count
+    assert_equal "verified-unchanged", result.last.first.fetch("state")
+    Dir.glob(File.join(@data, "versions", "**", "*")).select { |path| File.file?(path) }.each do |path|
+      assert_includes reads, path
+      assert_includes hashes, File.binread(path) if %w[raw.json conversation.md].include?(File.basename(path))
+    end
+    assert_equal @archive.version!("old-chat", result.last.first.dig("current", "version")),
+      reader.version!("old-chat", result.last.first.dig("current", "version"))
+  end
+
+  # Same-length restored-mtime corruption must fail for current, noncurrent and
+  # unreferenced bundles. Cache entries cannot authorize either payload's bytes.
+  def test_cache_corruption_across_history_and_unreferenced_bundles
+    queue, reader = prime_validation_cache
+    %w[Hello2 Hello3].each { |text| @archive.ingest(JSON.generate(package(queue, raw(text: text))), queue) }
+    receipts = @archive.observations("old-chat")
+    orphan = receipts.shift
+    File.delete(File.join(@data, "versions/old-chat/observations", orphan.fetch("package_sha256") + ".json"))
+    File.binwrite(File.join(@data, "versions/old-chat/current.json"), JSON.generate(receipts.last))
+    reader.select(inventory.fetch("conversations"), [])
+    versions.each do |metadata_path|
+      %w[raw.json conversation.md].each do |member|
+        path = File.join(File.dirname(metadata_path), member)
+        with_same_length_corruption(path) { assert_raises(SnapshotArchiveError) { reader.select(inventory.fetch("conversations"), []) } }
+      end
+    end
+  end
+
+  # A deliberate raw-hash bypass makes the corruption safety assertion fail,
+  # demonstrating that the control detects omission of mandatory byte hashing.
+  def test_cache_safety_control_detects_a_hash_bypass
+    _, reader = prime_validation_cache
+    path = Dir.glob(File.join(@data, "versions/old-chat/*/raw.json")).fetch(0)
+    original_hash = Digest::SHA256.method(:hexdigest)
+    expected = original_hash.call(File.binread(path))
+    with_same_length_corruption(path) do |changed|
+      Digest::SHA256.stub(:hexdigest, ->(text) { text == changed ? expected : original_hash.call(text) }) do
+        assert_raises(Minitest::Assertion) do
+          assert_raises(SnapshotArchiveError) { reader.select(inventory.fetch("conversations"), []) }
+        end
+      end
+    end
+  end
+
+  # Changed raw hashes force real strict parsing, binding and whole-graph checks,
+  # including inactive branches, even when metadata's exact hash is recomputed.
+  def test_cache_misses_revalidate_raw_semantics_and_identity
+    _, reader = prime_validation_cache
+    path = Dir.glob(File.join(@data, "versions/old-chat/*/raw.json")).fetch(0)
+    metadata_path = File.join(File.dirname(path), "version.json")
+    original, metadata_text = File.binread(path), File.binread(metadata_path)
+    mutations = [
+      ->(content) { content["id"] = "another-chat" },
+      ->(content) { content["account_id"] = "other-account" },
+      ->(content) { content["project_id"] = "other-project" },
+      ->(content) { content["conversation_id"] = "another-chat" },
+      ->(content) { content["mapping"]["inactive"]["parent"] = "absent" },
+      ->(content) { content["mapping"]["inactive"]["parent"] = "inactive" },
+      ->(content) { content["mapping"]["inactive"]["message"] = {} },
+      ->(content) { content["unsafe_number"] = 9_007_199_254_740_992 }
+    ].map do |mutation|
+      content = JSON.parse(original)
+      mutation.call(content)
+      JSON.generate(content)
+    end
+    mutations += [original.sub('{', '{"id":"duplicate",'), original.sub('"preserve":true', '"preserve":1e999')]
+    mutations.each do |changed|
+      File.binwrite(path, changed)
+      metadata = JSON.parse(metadata_text).merge("raw_sha256" => Digest::SHA256.hexdigest(changed))
+      File.binwrite(metadata_path, JSON.generate(SnapshotArchive.seal(metadata)))
+      called = false
+      original_validation = reader.method(:raw_semantics!)
+      reader.stub(:raw_semantics!, ->(*args) { called = true; original_validation.call(*args) }) do
+        assert_raises(SnapshotArchiveError, JSON::ParserError) { reader.select(inventory.fetch("conversations"), []) }
+      end
+      assert called, "cache miss bypassed full validation"
+    end
+  ensure
+    File.binwrite(path, original) if original
+    File.binwrite(metadata_path, metadata_text) if metadata_text
+  end
+
+  # A damaged or foreign cache is disposable; valid policy changes invalidate
+  # entries. No fallback can turn invalid authoritative raw into success.
+  def test_cache_lifecycle_misses_and_policy_invalidation
+    _, reader = prime_validation_cache
+    path = File.join(@state, "snapshot_validation_cache.json")
+    original = File.binread(path)
+    expected = reader.select(inventory.fetch("conversations"), [])
+    envelope = JSON.parse(original)
+    wrong_checksum = JSON.generate(envelope.merge("sha256" => "0" * 64))
+    variants = [nil, "", "{", "[]", wrong_checksum]
+    policy_changed = nil
+    %w[binding policy entries].each do |field|
+      changed = JSON.parse(original)
+      changed["payload"][field] = case field
+      when "binding" then @archive.binding.merge("account_id" => "foreign-account")
+      when "policy" then "0" * 64
+      else { "0" * 64 => { "value" => "invented", "status" => "valid" } }
+      end
+      changed["sha256"] = Digest::SHA256.hexdigest(JSON.generate(changed["payload"]))
+      text = JSON.generate(changed)
+      policy_changed = text if field == "policy"
+      variants << text
+    end
+    variants.each do |text|
+      text ? File.binwrite(path, text) : File.delete(path)
+      result = count = nil
+      capture_io { result, count = count_raw_validation { reader.select(inventory.fetch("conversations"), []) } }
+      assert_equal expected, result
+      assert_equal 1, count
+      assert_equal text, File.binread(path) if text && text != policy_changed
+    end
+    File.binwrite(path, original)
+    raw_path = Dir.glob(File.join(@data, "versions/old-chat/*/raw.json")).fetch(0)
+    with_same_length_corruption(raw_path) do
+      File.delete(path)
+      assert_raises(SnapshotArchiveError) { reader.select(inventory.fetch("conversations"), []) }
+      refute File.exist?(path), "failed validation published a success cache"
+    end
+  end
+
+  # Unavailable writes, symlink/directory/hardlink/foreign destinations and
+  # interrupted atomic publication preserve authoritative decisions and files.
+  def test_cache_unavailable_unsafe_and_interrupted_publication
+    _, reader = prime_validation_cache
+    path = File.join(@state, "snapshot_validation_cache.json")
+    original = File.binread(path)
+    expected = reader.select(inventory.fetch("conversations"), [])
+    destination = File.join(@root, "foreign")
+    File.binwrite(destination, "foreign bytes")
+    File.delete(path)
+    [-> { File.symlink(destination, path) }, -> { Dir.mkdir(path) }, -> { File.link(destination, path) },
+      -> { File.binwrite(path, "foreign bytes") }].each do |install|
+      install.call
+      result = nil
+      capture_io { result = reader.select(inventory.fetch("conversations"), []) }
+      assert_equal expected, result
+      assert_equal "foreign bytes", File.binread(destination)
+      File.directory?(path) ? Dir.rmdir(path) : File.delete(path)
+    end
+    File.binwrite(path, original)
+    rename = File.method(:rename)
+    File.stub(:rename, ->(source, target) { target == path ? (raise Errno::EACCES, "synthetic interrupted cache publication") : rename.call(source, target) }) do
+      capture_io { assert_equal expected, reader.select(inventory.fetch("conversations"), []) }
+    end
+    assert_equal original, File.binread(path)
+    assert_empty Dir.glob(path + ".tmp-*")
+    open_file = File.method(:open)
+    File.stub(:open, ->(target, *args, &block) { target.start_with?(path) ? (raise Errno::EACCES, "synthetic unavailable cache") : open_file.call(target, *args, &block) }) do
+      capture_io { assert_equal expected, reader.select(inventory.fetch("conversations"), []) }
+    end
+    assert_raises(SnapshotArchiveError) do
+      SnapshotArchive.new(root: @data, project_id: "g-p-test", account_id: "account-test", validation_cache_path: File.join(@data, "cache"))
+    end
+  end
+
+  # Every new operation notices index/journal/namespace changes. Compare cached
+  # selection directly with uncached verification, including valid repair rules.
+  def test_cache_live_namespace_journal_and_index_checks
+    _, reader = prime_validation_cache
+    base = File.join(@data, "versions/old-chat")
+    index = File.join(base, "current.json")
+    original_index = File.binread(index)
+    File.delete(index)
+    assert_nil reader.current!("old-chat")
+    assert_equal @archive.select(inventory.fetch("conversations"), []), reader.select(inventory.fetch("conversations"), [])
+    assert_equal JSON.parse(original_index), reader.current!("old-chat", repair: true)
+    version_dir = File.dirname(Dir.glob(File.join(base, "*/raw.json")).fetch(0))
+    member = File.join(version_dir, "conversation.md")
+    text = File.binread(member)
+    File.delete(member)
+    assert_raises(SnapshotArchiveError) { reader.current!("old-chat") }
+    File.binwrite(member, text)
+    extra = File.join(version_dir, "unexpected")
+    File.binwrite(extra, "unexpected")
+    assert_raises(SnapshotArchiveError) { reader.current!("old-chat") }
+    File.delete(extra)
+    File.rename(member, member + ".saved")
+    File.symlink(member + ".saved", member)
+    assert_raises(SnapshotArchiveError) { reader.current!("old-chat") }
+    File.delete(member)
+    File.rename(member + ".saved", member)
+    receipt_path = Dir.glob(File.join(base, "observations/*.json")).fetch(0)
+    receipt = File.binread(receipt_path)
+    changed = JSON.parse(receipt)
+    changed["source"]["generated_at"] = "2026-10-13T12:00:00.000Z"
+    File.binwrite(receipt_path, JSON.generate(SnapshotArchive.seal(changed)))
+    assert_raises(SnapshotArchiveError) { reader.current!("old-chat") }
+    File.binwrite(receipt_path, receipt)
+    File.rename(receipt_path, receipt_path + ".saved")
+    assert_raises(SnapshotArchiveError) { reader.current!("old-chat") }
+    File.delete(index)
+    assert_nil reader.current!("old-chat", repair: true)
+    File.rename(receipt_path + ".saved", receipt_path)
+    reader.current!("old-chat", repair: true)
+    File.binwrite(index, JSON.generate(SnapshotArchive.seal(JSON.parse(receipt).merge("package_sha256" => "0" * 64))))
+    assert_raises(SnapshotArchiveError) { reader.current!("old-chat", repair: true) }
+  end
+
+  # Reusing an archive instance never reuses selection or completion state after
+  # ingestion, a listing change, or changed archive binding. Raw reuse is separate.
+  def test_cache_same_instance_incremental_ingestion_and_listing_changes
+    queue, reader = prime_validation_cache
+    changed_listing = inventory.fetch("conversations").map { |entry| entry.merge("update_time" => "2026-10-08T12:00:00.000Z") }
+    result, count = count_raw_validation { reader.select(changed_listing, []) }
+    assert_equal "updated", result.last.first.fetch("state")
+    assert_equal 0, count
+    reader.ingest(JSON.generate(package(queue, raw(text: "New version"))), queue)
+    result, count = count_raw_validation { reader.select(inventory.fetch("conversations"), []) }
+    assert_equal @archive.current!("old-chat"), result.last.first.fetch("current")
+    assert_equal 0, count
+    binding_path = File.join(@data, "versions/binding.json")
+    File.binwrite(binding_path, JSON.generate(SnapshotArchive.seal(@archive.binding.merge("account_id" => "other-account"))))
+    assert_raises(SnapshotArchiveError) { reader.select(inventory.fetch("conversations"), []) }
+  end
+
+  # Source-byte policy changes miss, while a relocated archive with identical
+  # bytes/bindings can reuse successes. Changed content still requires validation.
+  def test_cache_source_fingerprint_and_relocated_archive
+    queue, reader = prime_validation_cache
+    cache_path = File.join(@state, "snapshot_validation_cache.json")
+    original_cache = File.binread(cache_path)
+    original_read = File.method(:binread)
+    source_path = File.expand_path("../snapshot_archive.rb", __dir__)
+    result = count = nil
+    File.stub(:binread, ->(path, *args) { original_read.call(path, *args) + (path == source_path ? "\n# changed verifier policy\n" : "") }) do
+      result, count = count_raw_validation { reader.select(inventory.fetch("conversations"), []) }
+    end
+    assert_equal 1, count
+    File.binwrite(cache_path, original_cache)
+    copy = File.join(@root, "archive-copy")
+    FileUtils.cp_r(@data, copy)
+    relocated = SnapshotArchive.new(root: copy, project_id: "g-p-test", account_id: "account-test", validation_cache_path: cache_path)
+    copied_result, count = count_raw_validation { relocated.select(inventory.fetch("conversations"), []) }
+    assert_equal result, copied_result
+    assert_equal 0, count
+    _, count = count_raw_validation { relocated.ingest(JSON.generate(package(queue, raw(text: "New bytes"))), queue) }
+    assert_operator count, :>=, 1
+    _, count = count_raw_validation { reader.select(inventory.fetch("conversations"), []) }
+    assert_equal 0, count
+  end
+
+  # Warm readers notice added/renamed receipts and bundles, bad metadata,
+  # stale indexes and missing bindings; repairs preserve the original journal.
+  def test_cache_namespace_additions_metadata_tampering_and_stale_indexes
+    queue, reader = prime_validation_cache
+    base = File.join(@data, "versions/old-chat")
+    index = File.join(base, "current.json")
+    old_index = File.binread(index)
+    @archive.ingest(JSON.generate(package(queue, raw(text: "Hello later"), started: "2026-10-13T12:00:00.000Z")), queue)
+    latest = reader.current!("old-chat")
+    File.binwrite(index, old_index)
+    assert_nil reader.current!("old-chat")
+    assert_equal latest, reader.current!("old-chat", repair: true)
+    metadata = Dir.glob(File.join(base, "*/version.json")).fetch(0)
+    original = File.binread(metadata)
+    File.binwrite(metadata, JSON.generate(JSON.parse(original).merge("markdown_sha256" => "0" * 64)))
+    assert_raises(SnapshotArchiveError) { reader.current!("old-chat") }
+    File.binwrite(metadata, original)
+    receipt_path = Dir.glob(File.join(base, "observations/*.json")).fetch(0)
+    addition = File.join(base, "observations", "0" * 64 + ".json")
+    FileUtils.cp(receipt_path, addition)
+    assert_raises(SnapshotArchiveError) { reader.current!("old-chat") }
+    File.delete(addition)
+    bundle = File.dirname(metadata)
+    renamed = File.join(base, "0" * 64)
+    File.rename(bundle, renamed)
+    assert_raises(SnapshotArchiveError) { reader.current!("old-chat") }
+    File.rename(renamed, bundle)
+    FileUtils.mkdir_p(renamed)
+    assert_raises(SnapshotArchiveError) { reader.current!("old-chat") }
+    Dir.rmdir(renamed)
+    File.rename(bundle, bundle + ".saved")
+    assert_raises(Errno::ENOENT) { reader.current!("old-chat") }
+    File.rename(bundle + ".saved", bundle)
+    File.delete(File.join(@data, "versions/binding.json"))
+    assert_raises(SnapshotArchiveError) { reader.current!("old-chat") }
+  end
+
+  # Invoke the actual CLI in a fresh process with an isolated tooling/.state.
+  # Freeze only report generation time so complete queue checksums can be compared;
+  # return report, validated queue and completed IDs, raising on CLI failures.
+  def cache_cli(tooling, full_verify: false, date: nil)
+    clock = File.join(tooling, "fixed_clock.rb")
+    File.binwrite(clock, 'class << Time; def now; Time.utc(2026, 10, 30); end; end')
+    output, errors, status = Open3.capture3({ "CHAT_EXPORT_FULL_VERIFY" => full_verify ? "1" : nil,
+      "CHAT_EXPORT_ONLY_LOCAL_DATE" => date }, RbConfig.ruby, "-r", clock,
+      File.join(tooling, "reconcile_exports.rb"), @data, File.join(@data, "Synthetic Project Inventory.json"))
+    assert status.success?, errors
+    assert_includes output, "Pending IDs:"
+    assert_empty errors
+    state = File.join(tooling, ".state")
+    values = %w[reconciliation pending_ids completed_ids].map { |name| read_json(File.join(state, name + ".json")) }
+    SnapshotArchive.queue!(values[1])
+    values
+  end
+
+  # New-process full/cold/warm CLI decisions agree through actual browser fixture
+  # and watcher ingestion, recovery limiting, completion and date-scoped selection.
+  def test_cache_cli_equivalence_and_browser_watcher_journey
+    tooling = File.join(@root, "tooling")
+    FileUtils.mkdir_p(tooling)
+    Dir.glob(File.expand_path("../*.{rb,js}", __dir__)).each { |source| FileUtils.cp(source, tooling) }
+    rows = [row] + (1..12).map { |number| row("legacy-#{number}", update: "2026-10-08T12:00:00.000Z") }
+    FileUtils.mkdir_p(File.join(@data, "raw"))
+    rows.drop(1).each { |entry| File.binwrite(File.join(@data, "raw", entry["id"] + ".json"), JSON.generate("id" => entry["id"])) }
+    reconcile(inventory(rows))
+    reference = cache_cli(tooling, full_verify: true)
+    cold = cache_cli(tooling)
+    assert_equal reference, cold
+    assert_equal reference, cache_cli(tooling)
+    queue = cold[1]
+    assert_equal 10, queue.fetch("pending").count { |entry| entry["reason"] == "unknown-legacy" }
+    File.binwrite(File.join(@state, "pending_ids.json"), JSON.generate(queue))
+    downloaded = browser(queue, [raw], { "stopAfter" => 1 })
+    watch(downloaded.fetch("downloads").first.fetch("text"))
+    reference = cache_cli(tooling, full_verify: true)
+    assert_equal reference, cache_cli(tooling)
+    assert_equal reference, cache_cli(tooling)
+    assert_equal "verified-unchanged", reference[0].fetch("freshness").find { |entry| entry["id"] == "old-chat" }.fetch("state")
+    assert_equal cache_cli(tooling, full_verify: true, date: "2026-10-09"), cache_cli(tooling, date: "2026-10-09")
+    path = Dir.glob(File.join(@data, "versions/old-chat/*/raw.json")).fetch(0)
+    with_same_length_corruption(path) do
+      _, errors, status = Open3.capture3(RbConfig.ruby, File.join(tooling, "reconcile_exports.rb"), @data)
+      refute status.success?
+      assert_includes errors, "RECONCILIATION FAILED"
+    end
+  end
+
   # The inclusive tolerance crosses second boundaries without accepting >1 hour,
   # missing/invalid evidence, or either source timestamp after request start.
   def test_one_hour_freshness_boundaries_and_clock_guards

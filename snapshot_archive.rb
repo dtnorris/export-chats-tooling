@@ -13,6 +13,116 @@ class SnapshotJSON < Hash
   end
 end
 
+# A disposable cache of successful raw semantics, never archive evidence. Each
+# operation loads a bounded, checksummed file and publishes only after success.
+# Invalid/unavailable caches warn and fall back; unsafe/foreign files are retained.
+class SnapshotValidationCache
+  SCHEMA = "chat-raw-validation-cache/v1"
+  MAX_BYTES = 16 * 1024 * 1024
+  MAX_ENTRIES = 20_000
+
+  # Bind derived entries to archive identities and all verifier/helper source.
+  # Accept an explicit tooling-state path; cache I/O errors become diagnostics.
+  def initialize(path:, binding:)
+    @path, @binding = path, binding
+    @entries = {}
+    @writable = false
+    sources = [__FILE__, File.join(__dir__, "reconcile_exports.rb")].map { |source| File.binread(source) }
+    @policy = Digest::SHA256.hexdigest((sources + [RUBY_DESCRIPTION, JSON::VERSION]).join("\0"))
+    load_entries
+  rescue SystemCallError, IOError => error
+    warn "Snapshot validation cache unavailable: #{error.message}; using full verification"
+  end
+
+  # Return normalized fetched time for these freshly hashed bytes, or validate
+  # through the caller block on a miss. Exceptions propagate without publication.
+  def fetch(id, version, raw_sha256)
+    key = Digest::SHA256.hexdigest(JSON.generate([id, version, raw_sha256]))
+    @entries[key] ||= yield.transform_keys(&:to_s)
+    @entries.fetch(key).transform_keys(&:to_sym)
+  end
+
+  # Publish bounded derived results with exclusive temp creation and atomic
+  # replacement. An interrupted write leaves the old cache usable; I/O warns.
+  def publish
+    return unless @writable
+
+    safe_path!
+    FileUtils.mkdir_p(File.dirname(@path))
+    payload = { "schema" => SCHEMA, "binding" => @binding, "policy" => @policy,
+      "entries" => @entries.to_a.last(MAX_ENTRIES).to_h }
+    text = JSON.generate({ "payload" => payload, "sha256" => Digest::SHA256.hexdigest(JSON.generate(payload)) })
+    return if text.bytesize > MAX_BYTES
+
+    temp = "#{@path}.tmp-#{SecureRandom.hex(8)}"
+    File.open(temp, File::WRONLY | File::CREAT | File::EXCL, 0o600) { |file| file.write(text); file.fsync }
+    File.rename(temp, @path)
+    File.open(File.dirname(@path), File::RDONLY) { |directory| directory.fsync }
+  rescue SystemCallError, IOError, SnapshotArchiveError => error
+    warn "Snapshot validation cache unavailable: #{error.message}; full verification remains authoritative"
+  ensure
+    if defined?(temp) && temp && File.exist?(temp)
+      begin
+        File.delete(temp)
+      rescue SystemCallError, IOError => error
+        warn "Snapshot validation cache temporary file retained: #{error.message}"
+      end
+    end
+  end
+
+  private
+
+  # Reject symlink components, nonregular files and hard links before cache I/O.
+  # Returns nil; raises on unsafe paths, without following or replacing them.
+  def safe_path!
+    current = @path
+    loop do
+      raise SnapshotArchiveError, "unsafe cache symlink: #{current}" if File.symlink?(current)
+      if File.exist?(current)
+        stat = File.lstat(current)
+        safe = current == @path ? stat.file? && stat.nlink == 1 : stat.directory?
+        raise SnapshotArchiveError, "unsafe cache path: #{current}" unless safe
+      end
+      break if current == "/"
+      current = File.dirname(current)
+    end
+    nil
+  end
+
+  # Load only strictly shaped, bounded, integrity-checked success data. A policy
+  # change misses; malformed/foreign existing files are never overwritten.
+  def load_entries
+    safe_path!
+    unless File.exist?(@path)
+      @writable = true
+      return
+    end
+    text = File.open(@path, "rb") { |file| file.read(MAX_BYTES + 1) }.to_s
+    raise SnapshotArchiveError, "oversized cache" if text.bytesize > MAX_BYTES
+    envelope = SnapshotArchive.parse(text)
+    raise SnapshotArchiveError, "invalid cache envelope" unless envelope.is_a?(Hash) && envelope.keys.sort == %w[payload sha256]
+    payload = envelope["payload"]
+    raise SnapshotArchiveError, "cache checksum mismatch" unless envelope["sha256"] == Digest::SHA256.hexdigest(JSON.generate(payload))
+    raise SnapshotArchiveError, "cache binding/shape mismatch" unless payload.is_a?(Hash) && payload.keys.sort == %w[binding entries policy schema] &&
+      payload["schema"] == SCHEMA && payload["binding"] == @binding && /\A[0-9a-f]{64}\z/.match?(payload["policy"].to_s) &&
+      payload["entries"].is_a?(Hash) && payload["entries"].length <= MAX_ENTRIES &&
+      payload["entries"].all? { |key, value| /\A[0-9a-f]{64}\z/.match?(key) && valid_fetched?(value) }
+    @writable = true
+    @entries = payload["entries"] if payload["policy"] == @policy
+  rescue SystemCallError, IOError, JSON::ParserError, SnapshotArchiveError => error
+    warn "Snapshot validation cache ignored: #{error.message}; using full verification"
+  end
+
+  # Accept only the timestamp normalizer's exact successful output shape.
+  # Returns Boolean; malformed cache data never becomes receipt freshness.
+  def valid_fetched?(value)
+    value.is_a?(Hash) && value.keys.sort == %w[status value] &&
+      ((value["status"] == "valid" && value["value"].is_a?(String) &&
+        ReconcileHelpers.inventory_timestamp(value["value"]) == value.transform_keys(&:to_sym)) ||
+       (%w[missing invalid].include?(value["status"]) && value["value"].nil?))
+  end
+end
+
 # Append complete conversation versions and capture observations in a single-writer
 # local archive. Inputs are unedited local producer packages, not signed evidence.
 # Operations raise SnapshotArchiveError or filesystem/JSON errors on unsafe paths,
@@ -48,8 +158,12 @@ class SnapshotArchive
   end
 
   # Bind an existing archive to project/account strings; do not create any files.
-  def initialize(root:, project_id:, account_id:)
+  def initialize(root:, project_id:, account_id:, validation_cache_path: nil)
     @root = File.expand_path(root)
+    @validation_cache_path = validation_cache_path && File.expand_path(validation_cache_path)
+    if @validation_cache_path && (@validation_cache_path == @root || @validation_cache_path.start_with?(@root + "/"))
+      raise SnapshotArchiveError, "validation cache must be outside archive"
+    end
     @project_id = project_id
     @account_id = account_id
     [project_id, account_id].each { |identity| self.class.identity!(identity) }
@@ -194,27 +308,66 @@ class SnapshotArchive
   # Read one complete bundle by digest. Verify metadata, raw content and both
   # file hashes; incomplete/tampered bundles fail instead of counting as complete.
   def version!(id, version)
+    return verification_operation { version!(id, version) } unless @verification
+
     self.class.identity!(id)
     raise SnapshotArchiveError, "invalid version digest" unless /\A[0-9a-f]{64}\z/.match?(version.to_s)
+    return @verification.fetch([id, version]).first if @verification.key?([id, version])
+
     base = "versions/#{id}/#{version}"
     raise SnapshotArchiveError, "incomplete or unexpected bundle files" unless Dir.children(path!(base)).sort == %w[conversation.md raw.json version.json]
     metadata = self.class.verify!(self.class.parse(File.binread(path!("#{base}/version.json"))))
     raw_text = File.binread(path!("#{base}/raw.json"))
     markdown = File.binread(path!("#{base}/conversation.md"))
-    raw = validate_raw!(self.class.parse(raw_text), id)
+    raw_sha256 = Digest::SHA256.hexdigest(raw_text)
+    fetched = if @validation_cache
+      @validation_cache.fetch(id, version, raw_sha256) { raw_semantics!(raw_text, id, version) }
+    else
+      raw_semantics!(raw_text, id, version)
+    end
     unless metadata == self.class.seal({
       "schema" => SCHEMA, "project_id" => @project_id, "account_id" => @account_id,
       "conversation_id" => id, "version" => version, "renderer" => RENDERER,
-      "raw_sha256" => Digest::SHA256.hexdigest(raw_text), "markdown_sha256" => Digest::SHA256.hexdigest(markdown)
-    }) && version == self.class.digest(raw) && !markdown.empty?
+      "raw_sha256" => raw_sha256, "markdown_sha256" => Digest::SHA256.hexdigest(markdown)
+    }) && !markdown.empty?
       raise SnapshotArchiveError, "version identity/hash conflict"
     end
+    @verification[[id, version]] = [metadata, fetched]
     metadata
+  end
+
+  # Fully validate exact raw bytes against identity, graph and structural version;
+  # return normalized fetched time. Parser/semantic errors propagate on misses.
+  def raw_semantics!(raw_text, id, version)
+    raw = validate_raw!(self.class.parse(raw_text), id)
+    raise SnapshotArchiveError, "version identity/hash conflict" unless version == self.class.digest(raw)
+    ReconcileHelpers.inventory_timestamp(raw["update_time"])
+  end
+
+  # Share only complete bundles within one public lookup/selection operation.
+  # Always recheck archive binding; later calls re-enumerate and rehash everything.
+  # Persist successes only after the whole operation returns; errors propagate.
+  def verification_operation
+    @verification = {}
+    versions = path!("versions")
+    if Dir.exist?(versions) && !File.exist?(path!("versions/binding.json")) &&
+        Dir.children(versions).any? { |name| !name.start_with?(".") }
+      raise SnapshotArchiveError, "archive binding missing from existing versions"
+    end
+    conflict!("versions/binding.json", JSON.pretty_generate(binding) + "\n")
+    @validation_cache = SnapshotValidationCache.new(path: @validation_cache_path, binding: binding) if @validation_cache_path
+    result = yield
+    @validation_cache&.publish
+    result
+  ensure
+    @verification = @validation_cache = nil
   end
 
   # Return verified observations in deterministic capture order. Staged files are
   # never completion evidence; unreferenced bundles await download replay.
   def observations(id)
+    return verification_operation { observations(id) } unless @verification
+
     self.class.identity!(id)
     directory = path!("versions/#{id}")
     return [] unless Dir.exist?(directory)
@@ -235,8 +388,7 @@ class SnapshotArchive
         receipt["message_count"].is_a?(Integer) && receipt["message_count"].positive? &&
         receipt["source"]["generated_at"] <= receipt["request_started_at"] &&
         receipt["listing"]["last_observed_at"] <= receipt["request_started_at"]
-      raw = self.class.parse(File.binread(path!("versions/#{id}/#{receipt["version"]}/raw.json")))
-      fetched = ReconcileHelpers.inventory_timestamp(raw["update_time"])
+      fetched = @verification.fetch([id, receipt["version"]]).last
       raise SnapshotArchiveError, "observation freshness conflict" unless receipt["fetched_update"] == fetched.transform_keys(&:to_s) &&
         receipt["freshness"] == freshness(receipt["listing"], fetched, receipt["request_started_at"], schema: receipt["schema"])
       receipt
@@ -248,7 +400,15 @@ class SnapshotArchive
   # With repair, rebuild a missing/stale valid index after interruption. Corrupt or
   # invented indexes fail closed; no snapshot/source content is ever replaced.
   def current!(id, repair: false)
+    return verification_operation { current!(id, repair: repair) } unless @verification
+
     receipts = observations(id)
+    current_from_observations!(id, receipts, repair: repair)
+  end
+
+  # Verify a live index against this operation's fully checked journal; optionally
+  # repair a missing/stale valid index. Returns receipt/nil; corrupt indexes raise.
+  def current_from_observations!(id, receipts, repair: false)
     relative = "versions/#{id}/current.json"
     path = path!(relative)
     if File.exist?(path)
@@ -260,6 +420,7 @@ class SnapshotArchive
     atomic!(relative, JSON.pretty_generate(receipts.last) + "\n")
     receipts.last
   end
+  private :current_from_observations!
 
   # Compare validated listing/fetched timestamps without rounding or changing them.
   # Historical v1/v2 receipts retain equality/one-second policies; new v3
@@ -310,11 +471,13 @@ class SnapshotArchive
   # An optional block receives no arguments after each checked record, for progress.
   # Returns [pending, per-ID evidence states]; corrupt archive evidence raises.
   def select(records, legacy_ids)
+    return verification_operation { select(records, legacy_ids) { yield if block_given? } } unless @verification
+
     recovery_count = 0
     states = records.to_h do |record|
       id = self.class.identity!(record.fetch("id"))
       receipts = observations(id)
-      latest = current!(id)
+      latest = current_from_observations!(id, receipts)
       evaluated_freshness = latest && capture_freshness(latest)
       captured = !!captured_unchanged?(latest, record)
       reason = if captured

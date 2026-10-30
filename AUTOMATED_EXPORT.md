@@ -322,6 +322,50 @@ legacy paths or edit `current.json`. Copying an older reading does not change
 archival freshness or restore messages into ChatGPT; a subsequent real capture
 records any provider-side restoration as a new observation.
 
+### Snapshot verification cache
+
+Daily reconciliation enumerates the live namespace and reads authoritative bytes
+on every run: binding evidence, all historical and unreferenced bundles for known
+inventory IDs, observation journals and current indexes. Exact raw and Markdown
+SHA-256 hashes, metadata integrity, complete bundle membership, containment/symlink
+checks, receipt provenance/freshness and index checks remain live. Within one
+selection or lookup, complete bundle validation is shared; a later call on the
+same archive instance starts fresh. No selection/completion decision is cached.
+
+Only successful strict raw parsing/numeric checks, identity/full-mapping checks,
+structural digest verification and normalized fetched update time are reusable.
+Reconciliation stores derived timestamps, never conversation payloads, in ignored
+tooling `.state/snapshot_validation_cache.json`, outside the archive. Keys bind
+fresh raw SHA-256, expected structural version and conversation ID; the file binds
+project/account archive identity and a SHA-256 fingerprint of the exact
+`snapshot_archive.rb` and `reconcile_exports.rb` source bytes plus Ruby/JSON runtime
+versions. Changes invalidate reuse, including timestamp and structural encoding helpers.
+Moving an otherwise identical archive does not invalidate successful semantics.
+Future semantic dependencies must be added to this fingerprint.
+
+The versioned, strictly shaped cache has an integrity checksum and limits of
+20,000 entries and 16 MiB. Replacement uses an exclusively created temporary file,
+fsync and atomic rename. Missing, damaged, wrong-binding or outdated cache data
+falls back to full validation; malformed/foreign existing files are retained with
+a diagnostic instead of overwritten. Unsafe symlink, hardlink or nonregular cache
+paths are refused without following them. Read/write failures cannot authorize
+archive content or suppress archive errors. Remove the cache file to rebuild it;
+interrupted publication leaves the prior cache usable. No archive history changes.
+Use `CHAT_EXPORT_FULL_VERIFY=1 ruby reconcile_exports.rb` for full raw semantic
+verification without reading or publishing the persistent cache. Standalone Ruby
+lookups default to full verification; optional `validation_cache_path:` enables
+the same reuse with an isolated tooling state path outside the archive.
+
+Cold runs do full semantic work; warm unchanged runs still incur enumeration,
+all authoritative reads/hashes and cache load/publication. Changed/new versions
+receive full semantic validation while unchanged versions remain reusable.
+Checksums detect accidental corruption, not malicious re-signing. The existing
+single local writer contract remains required, including for tooling state;
+hostile concurrent filesystem mutation is outside these guarantees. Synthetic
+correctness checks do not establish the target 10x speedup. Representative-host
+performance acceptance remains pending three complete baseline and three warm
+new-process measurements, including cache I/O and full reconciliation time.
+
 ### Capture races and interruption recovery
 
 The browser binds its current selected account to the queue before fetching,

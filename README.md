@@ -129,6 +129,14 @@ CSV. Git-ignored .state/ files contain reconciliation results, pending IDs,
 capture status, and generated inventory/batch console scripts. Retain previous
 JSONs for recovery; CSV alone cannot authorize daily scans.
 
+Snapshot reconciliation always reads and hashes archive bytes, including historical
+and unreferenced bundles for inventory IDs. It reuses successful raw semantic checks
+only for exactly identical bytes and bindings in an ignored `.state/` cache. Cold
+runs rebuild it; delete `.state/snapshot_validation_cache.json` safely or run
+`CHAT_EXPORT_FULL_VERIFY=1 ruby reconcile_exports.rb` to bypass persistent reuse.
+See [verification cache guarantees](AUTOMATED_EXPORT.md#snapshot-verification-cache)
+for invalidation, fallback and performance limits.
+
 ### Import local Codex agent sessions
 
 `import_codex_sessions.rb` archives local Codex rollout JSONL files alongside
