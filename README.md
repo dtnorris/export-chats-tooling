@@ -154,39 +154,44 @@ file order. `event_msg.item_completed` repeats some of the same activity, so
 user/agent messages are not rendered twice; command, file change, extension,
 and nested tool diagnostics appear as distinct execution entries. Long tool
 arguments and outputs remain complete in collapsible blocks. Developer
-instructions and internal reasoning do not enter the readable view. The raw
-JSONL retains them, along with full event records, accounting, and non-text
+instructions and internal reasoning do not enter the readable view. Codex
+`additional_tools` response items are validated as tool-declaration envelopes
+and retained only in raw JSONL; tool schemas are opaque context, not conversation
+messages. Missing or malformed envelopes still fail the import. The raw JSONL
+retains these records, along with full event records, accounting, and non-text
 payloads. No transcript synthesis or LLM title generation is performed.
 
 Run these from the tooling checkout. The default source is
 `~/.codex/sessions`, recursively including existing and future year/month
 folders. `--source` can restrict a run to a particular subtree. The default
 destination is the sibling private `export-chats-data` checkout, which must
-already exist.
+already exist. These examples use the current account's home directory, so
+they work with different macOS usernames on the MacBook Pro and Mac mini.
+Do not copy an absolute home path from the other machine.
 
 ```bash
 # Import completed Codex sessions from previous days.
 # --settled-only skips today's sessions and files modified within the last 2 hours,
 # reducing the risk of archiving an active or recently resumed session.
 
-cd /Users/davidnorris/code/export-chats-tooling
+cd ~/code/export-chats-tooling
 
 # 1. Preview eligible imports without changing the archive.
 ruby import_codex_sessions.rb \
-  --source /Users/davidnorris/.codex/sessions \
-  --data-repo /Users/davidnorris/code/export-chats-data \
+  --source "$HOME/.codex/sessions" \
+  --data-repo "$HOME/code/export-chats-data" \
   --settled-only --dry-run
 
 # 2. Import eligible sessions.
 ruby import_codex_sessions.rb \
-  --source /Users/davidnorris/.codex/sessions \
-  --data-repo /Users/davidnorris/code/export-chats-data \
+  --source "$HOME/.codex/sessions" \
+  --data-repo "$HOME/code/export-chats-data" \
   --settled-only
 
 # 3. Verify idempotency: imported=0, failed=0, conflicting=0.
 ruby import_codex_sessions.rb \
-  --source /Users/davidnorris/.codex/sessions \
-  --data-repo /Users/davidnorris/code/export-chats-data \
+  --source "$HOME/.codex/sessions" \
+  --data-repo "$HOME/code/export-chats-data" \
   --settled-only --dry-run
 ```
 

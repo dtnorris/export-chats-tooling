@@ -173,6 +173,13 @@ class CodexSessionImporter
           end
         when "response_item"
           case payload["type"]
+          when "additional_tools"
+            # Tool declarations are execution context, not conversation. Match
+            # the protocol envelope; tool schemas are opaque JSON kept raw only.
+            raise CodexImportError, "invalid additional_tools response item" unless
+              payload["role"].is_a?(String) && payload["tools"].is_a?(Array) &&
+              (payload["id"].nil? || payload["id"].is_a?(String))
+            private_count += 1
           when "message"
             role = payload["role"]
             if role == "developer" || role == "system" || (role == "assistant" && %w[analysis summary].include?(payload["phase"]))

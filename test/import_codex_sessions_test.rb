@@ -607,6 +607,74 @@ class ImportCodexSessionsTest < Minitest::Test
     end
   end
 
+  # Synthetic declarations must remain byte-exact in raw, private in Markdown,
+  # and compatible with dry-run and repeat imports. Assertion failures fail test.
+  def test_additional_tools_preserves_raw_without_rendering_declarations
+    records = fixture
+    records.insert(3, row("response_item", {
+      "type" => "additional_tools", "role" => "developer", "id" => "at_synthetic",
+      "tools" => [{ "type" => "function", "name" => "synthetic_tool",
+                    "description" => "PRIVATE TOOL DECLARATION",
+                    "parameters" => { "type" => "object", "properties" => {} } },
+                  { "type" => "future_tool_schema", "opaque" => [1, nil, true] }] }))
+    path = write_rollout(records)
+    code, out, errors = run_import(dry_run: true)
+    assert_equal 0, code, errors
+    assert_includes out, "imported=1"
+    assert_empty markdown_paths
+    refute File.exist?(raw_path)
+
+    assert_equal 0, run_import.first
+    assert_equal File.binread(path), File.binread(raw_path)
+    md = File.binread(markdown_paths.fetch(0))
+    refute_includes md, "PRIVATE TOOL DECLARATION"
+    refute_includes md, "synthetic_tool"
+    assert_includes md, "private/internal records omitted from Markdown: 3"
+    assert_includes md, "Validation passed; synthetic handoff."
+    before = [raw_path, markdown_paths.fetch(0)].to_h do |name|
+      [name, [File.mtime(name), Digest::SHA256.file(name).hexdigest]]
+    end
+    code, out, errors = run_import
+    assert_equal 0, code, errors
+    assert_includes out, "unchanged=1"
+    assert_equal before, before.keys.to_h { |name| [name, [File.mtime(name), Digest::SHA256.file(name).hexdigest]] }
+  end
+
+  # Empty protocol declarations and absent/null optional IDs are valid envelopes.
+  # Inputs are synthetic rollouts; nonzero imports fail assertions.
+  def test_additional_tools_accepts_empty_tools_and_optional_id
+    records = fixture
+    records.insert(3, row("response_item", {
+      "type" => "additional_tools", "role" => "developer", "tools" => [] }))
+    records.insert(4, row("response_item", {
+      "type" => "additional_tools", "role" => "developer", "id" => nil, "tools" => [] }))
+    path = write_rollout(records)
+    code, _, errors = run_import
+    assert_equal 0, code, errors
+    assert_equal File.binread(path), File.binread(raw_path)
+  end
+
+  # Invalid declaration envelopes must fail dry-run and import without files.
+  # Each input replaces one protocol field; assertion failures fail the test.
+  def test_invalid_additional_tools_fails_closed_without_archive_files
+    valid = { "type" => "additional_tools", "role" => "developer", "tools" => [] }
+    [valid.reject { |key, _| key == "role" }, valid.merge("role" => nil),
+     valid.merge("role" => 7), valid.reject { |key, _| key == "tools" },
+     valid.merge("tools" => nil), valid.merge("tools" => {}),
+     valid.merge("tools" => "declarations"), valid.merge("id" => 7)].each do |payload|
+      records = fixture
+      records.insert(3, row("response_item", payload))
+      write_rollout(records)
+      [true, false].each do |dry_run|
+        code, _, errors = run_import(dry_run: dry_run)
+        assert_equal 1, code
+        assert_includes errors, "invalid additional_tools response item"
+        assert_empty markdown_paths
+        refute File.exist?(raw_path)
+      end
+    end
+  end
+
   def test_unexpected_response_structure_fails_closed
     records = fixture
     records.insert(3, row("response_item", { "type" => "unknown_future_item" }))
