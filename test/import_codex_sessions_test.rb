@@ -278,6 +278,46 @@ class ImportCodexSessionsTest < Minitest::Test
     assert_includes md, "Execution diagnostics: 2"
   end
 
+  # Preserves a completed collaboration call in the timeline and its full raw record.
+  def test_collaboration_tool_completion_preserves_summary_and_raw_record
+    records = fixture
+    records.insert(3, row("event_msg", { "type" => "item_completed", "item" => {
+      "type" => "CollabAgentToolCall", "id" => "collab-call-1", "tool" => "spawn_agent",
+      "status" => "completed", "sender_thread_id" => ID, "receiver_thread_ids" => [ID],
+      "prompt" => "PRIVATE COLLABORATION PROMPT", "agents_states" => {} } }))
+    path = write_rollout(records)
+    code, _, errors = run_import
+    assert_equal 0, code, errors
+    assert_equal File.binread(path), File.binread(raw_path)
+    md = File.read(markdown_paths.fetch(0), encoding: "UTF-8")
+    assert_includes md, "### Collaboration tool —"
+    assert_includes md, "Tool: `spawn_agent`"
+    assert_includes md, "Status: `completed`"
+    assert_includes md, "Call ID: `collab-call-1`"
+    refute_includes md, "PRIVATE COLLABORATION PROMPT"
+  end
+
+  # Keeps invalid known items and unrecognized completed items from being archived.
+  def test_invalid_or_unknown_collaboration_completion_fails_closed
+    valid = { "type" => "CollabAgentToolCall", "id" => "collab-call-1", "tool" => "spawn_agent",
+              "status" => "completed", "sender_thread_id" => ID }
+    cases = [
+      [valid.merge("status" => {}), "invalid collaboration tool completion"],
+      [valid.merge("sender_thread_id" => nil), "invalid collaboration tool completion"],
+      [valid.merge("type" => "UnknownCompletedItem"), "unsupported completed item"]
+    ]
+    cases.each do |item, expected_error|
+      records = fixture
+      records.insert(3, row("event_msg", { "type" => "item_completed", "item" => item }))
+      write_rollout(records)
+      code, _, errors = run_import
+      assert_equal 1, code
+      assert_includes errors, expected_error
+      assert_empty markdown_paths
+      refute File.exist?(raw_path)
+    end
+  end
+
   def test_malformed_subagent_activity_remains_rejected
     records = fixture
     records.insert(5, row("event_msg", { "type" => "item_completed", "item" => {
@@ -370,17 +410,57 @@ class ImportCodexSessionsTest < Minitest::Test
     assert_empty markdown_paths
   end
 
-  def test_plain_string_custom_tool_output_is_preserved
+  # Distinct results for one synthetic call must retain their positions and raw bytes.
+  def test_multiple_custom_tool_results_are_preserved_in_rollout_order
     records = fixture(tool: false)
-    records.insert(3, row("response_item", { "type" => "custom_tool_call", "call_id" => "call-2",
-                                              "name" => "exec", "input" => "test input" }))
-    records.insert(4, row("response_item", { "type" => "custom_tool_call_output",
-                                              "call_id" => "call-2", "output" => "plain text result" }))
+    records.insert(3,
+                   row("response_item", { "type" => "custom_tool_call", "call_id" => "call-2",
+                                          "name" => "exec", "input" => "test input" }),
+                   row("response_item", { "type" => "custom_tool_call_output",
+                                          "call_id" => "call-2", "output" => "first result" }),
+                   response_message("assistant", "Intervening commentary.", "commentary"),
+                   row("response_item", { "type" => "custom_tool_call_output",
+                                          "call_id" => "call-2", "output" => "second result" }))
     path = write_rollout(records)
     code, _, errors = run_import
     assert_equal 0, code, errors
     assert_equal File.binread(path), File.binread(raw_path)
-    assert_includes File.binread(markdown_paths.fetch(0)), "plain text result"
+    md = File.binread(markdown_paths.fetch(0))
+    assert_equal 2, md.scan("### Tool result: exec").length
+    assert_operator md.index("first result"), :<, md.index("Intervening commentary.")
+    assert_operator md.index("Intervening commentary."), :<, md.index("second result")
+    refute_includes md, "Unanswered tool calls"
+  end
+
+  # A result with an unseen call ID must fail without creating archive files.
+  def test_orphan_custom_tool_result_is_rejected
+    records = fixture
+    records.insert(3, row("response_item", { "type" => "custom_tool_call_output",
+                                              "call_id" => "orphan", "output" => "unmatched result" }))
+    write_rollout(records)
+    code, _, errors = run_import
+    assert_equal 1, code
+    assert_includes errors, 'tool result without preceding call: "orphan"'
+    assert_empty markdown_paths
+    refute File.exist?(raw_path)
+  end
+
+  # An additional function result is outside the custom-call behavior.
+  def test_multiple_function_tool_results_remain_rejected
+    records = fixture(tool: false)
+    records.insert(3,
+                   row("response_item", { "type" => "function_call", "call_id" => "call-2",
+                                          "name" => "exec", "arguments" => "{}" }),
+                   row("response_item", { "type" => "function_call_output",
+                                          "call_id" => "call-2", "output" => "first result" }),
+                   row("response_item", { "type" => "function_call_output",
+                                          "call_id" => "call-2", "output" => "second result" }))
+    write_rollout(records)
+    code, _, errors = run_import
+    assert_equal 1, code
+    assert_includes errors, 'tool result without preceding call: "call-2"'
+    assert_empty markdown_paths
+    refute File.exist?(raw_path)
   end
 
   def test_structured_function_tool_output_is_preserved

@@ -129,6 +129,7 @@ class CodexSessionImporter
     digest = Digest::SHA256.new
     parts = []
     calls = {}
+    custom_call_names = {}
     users = []
     meta = nil
     lifecycle = "incomplete (no task_complete record)"
@@ -200,7 +201,13 @@ class CodexSessionImporter
           when "custom_tool_call", "function_call"
             id = payload["call_id"]
             raise CodexImportError, "missing or repeated tool call ID" unless id.is_a?(String) && !id.empty? && !calls.key?(id)
-            calls[id] = payload["name"].to_s
+            name = payload["name"].to_s
+            calls[id] = name
+            if payload["type"] == "custom_tool_call"
+              custom_call_names[id] = name
+            else
+              custom_call_names.delete(id)
+            end
             arguments = payload["type"] == "function_call" ? payload["arguments"] : payload["input"]
             if payload["type"] == "function_call" && !arguments.is_a?(String)
               raise CodexImportError, "function call arguments are not a string"
@@ -208,8 +215,10 @@ class CodexSessionImporter
             parts << "### Tool call: #{escape(payload['name'])} — #{label}\n\nCall ID: `#{escape(id)}`\n\n#{details('Arguments', arguments)}\n"
           when "custom_tool_call_output", "function_call_output"
             id = payload["call_id"]
-            raise CodexImportError, "tool result without preceding call: #{id.inspect}" unless calls.key?(id)
             name = calls.delete(id)
+            # Later custom results can still refer to a call that already has a result.
+            name ||= custom_call_names[id] if payload["type"] == "custom_tool_call_output"
+            raise CodexImportError, "tool result without preceding call: #{id.inspect}" unless name
             output = payload["output"]
             # Codex permits either a raw string or structured items for both
             # function and custom tool outputs; do not coerce other shapes.
@@ -375,6 +384,16 @@ class CodexSessionImporter
       id = item["id"]
       raise CodexImportError, "invalid context compaction item" unless id.is_a?(String) && !id.empty?
       "### Context compaction — #{label}\n\nCheckpoint: `#{escape(id)}`. Compaction contents: raw JSONL.\n"
+    when "CollabAgentToolCall"
+      id = item["id"]
+      tool = item["tool"]
+      status = item["status"]
+      sender = item["sender_thread_id"]
+      raise CodexImportError, "invalid collaboration tool completion" unless
+        id.is_a?(String) && !id.empty? && tool.is_a?(String) && !tool.empty? &&
+        %w[in_progress completed failed interrupted].include?(status) &&
+        sender.is_a?(String) && ID.match?(sender)
+      "### Collaboration tool — #{label}\n\nTool: `#{escape(tool)}`. Status: `#{escape(status)}`. Call ID: `#{escape(id)}`. Full details: raw JSONL.\n"
     when "SubAgentActivity"
       kind = item["kind"]
       thread_id = item["agent_thread_id"]

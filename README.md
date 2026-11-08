@@ -150,11 +150,14 @@ timestamp); if absent, the UTC date is used. A heading explicitly present in a
 user message supplies the title; otherwise the title is `Codex Session <prefix>`.
 
 The importer reads `response_item` messages and paired tool calls/results in
-file order. `event_msg.item_completed` repeats some of the same activity, so
-user/agent messages are not rendered twice; command, file change, extension,
-and nested tool diagnostics appear as distinct execution entries. Long tool
-arguments and outputs remain complete in collapsible blocks. Developer
-instructions and internal reasoning do not enter the readable view. Codex
+file order. Multiple results for the same custom tool call appear in their
+recorded positions. `event_msg.item_completed` repeats some of the same activity,
+so user/agent messages are not rendered twice; command, file change, extension,
+and nested tool diagnostics appear as distinct execution entries. Collaboration
+tool completions show the tool, status, and call ID. Full completion details
+remain in raw JSONL. Long tool arguments and outputs remain complete in
+collapsible blocks. Developer instructions and internal reasoning do not enter
+the readable view. Codex
 `additional_tools` response items are validated as tool-declaration envelopes
 and retained only in raw JSONL; tool schemas are opaque context, not conversation
 messages. Codex `configuration_update` response items are validated as reasoning
