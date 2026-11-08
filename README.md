@@ -157,9 +157,10 @@ arguments and outputs remain complete in collapsible blocks. Developer
 instructions and internal reasoning do not enter the readable view. Codex
 `additional_tools` response items are validated as tool-declaration envelopes
 and retained only in raw JSONL; tool schemas are opaque context, not conversation
-messages. Missing or malformed envelopes still fail the import. The raw JSONL
-retains these records, along with full event records, accounting, and non-text
-payloads. No transcript synthesis or LLM title generation is performed.
+messages. Codex `configuration_update` response items are validated as reasoning
+settings and retained only in raw JSONL. Malformed envelopes still fail the
+import. The raw JSONL retains these records, full event records, accounting,
+and non-text payloads. No transcript synthesis or LLM title generation is performed.
 
 Run these from the tooling checkout. The default source is
 `~/.codex/sessions`, recursively including existing and future year/month

@@ -180,6 +180,12 @@ class CodexSessionImporter
               payload["role"].is_a?(String) && payload["tools"].is_a?(Array) &&
               (payload["id"].nil? || payload["id"].is_a?(String))
             private_count += 1
+          when "configuration_update"
+            # Reasoning settings are execution context retained in raw JSONL.
+            reasoning = payload["reasoning"]
+            raise CodexImportError, "invalid configuration_update response item" unless
+              reasoning.is_a?(Hash) && reasoning["effort"].is_a?(String)
+            private_count += 1
           when "message"
             role = payload["role"]
             if role == "developer" || role == "system" || (role == "assistant" && %w[analysis summary].include?(payload["phase"]))

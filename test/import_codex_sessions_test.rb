@@ -675,6 +675,49 @@ class ImportCodexSessionsTest < Minitest::Test
     end
   end
 
+  # Imports a synthetic settings update through dry-run and archive paths.
+  # Assertions verify raw-byte preservation and omission from the transcript.
+  def test_configuration_update_preserves_raw_without_rendering_settings
+    records = fixture
+    records.insert(3, row("response_item", {
+      "type" => "configuration_update", "reasoning" => { "effort" => "model-specific" } }))
+    path = write_rollout(records)
+
+    code, output, errors = run_import(dry_run: true)
+    assert_equal 0, code, errors
+    assert_includes output, "imported=1"
+    assert_empty markdown_paths
+    refute File.exist?(raw_path)
+
+    code, _, errors = run_import
+    assert_equal 0, code, errors
+    assert_equal File.binread(path), File.binread(raw_path)
+    md = File.binread(markdown_paths.fetch(0))
+    refute_includes md, "model-specific"
+    assert_includes md, "private/internal records omitted from Markdown: 3"
+    assert_includes md, "Validation passed; synthetic handoff."
+    assert_includes run_import[1], "unchanged=1"
+  end
+
+  # Exercises synthetic malformed settings in both modes and asserts no writes.
+  def test_invalid_configuration_update_fails_closed_without_archive_files
+    [nil, "high", {}, { "effort" => 5 }].each do |reasoning|
+      records = fixture
+      payload = { "type" => "configuration_update" }
+      payload["reasoning"] = reasoning unless reasoning.nil?
+      records.insert(3, row("response_item", payload))
+      write_rollout(records)
+
+      [true, false].each do |dry_run|
+        code, _, errors = run_import(dry_run: dry_run)
+        assert_equal 1, code
+        assert_includes errors, "invalid configuration_update response item"
+        assert_empty markdown_paths
+        refute File.exist?(raw_path)
+      end
+    end
+  end
+
   def test_unexpected_response_structure_fails_closed
     records = fixture
     records.insert(3, row("response_item", { "type" => "unknown_future_item" }))
