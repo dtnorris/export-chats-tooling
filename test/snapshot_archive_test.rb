@@ -1176,6 +1176,67 @@ class SnapshotArchiveTest < Minitest::Test
     end
   end
 
+  # A provider timeout leaves the previous snapshot intact and the update pending,
+  # while later captures ingest normally. A subsequent run can finish the update.
+  def test_browser_request_timeout_continues_without_claiming_completion
+    initial_queue, = reconcile(inventory([row("first")]))
+    @archive.ingest(JSON.generate(package(initial_queue, raw("first"))), initial_queue)
+    previous = @archive.current!("first")
+    update = "2026-10-10T00:00:00.000Z"
+    listing = inventory([row("first", update: update), row("second")])
+    queue, = reconcile(listing)
+    previous_files = files
+    result = browser(queue, [{ "status" => 500, "raw" => { "detail" => "Request timeout" } }, raw("second")])
+    assert_nil result["error"]
+    assert_equal ["first", "second"], result["requests"].drop(1).map { |request| request["url"].split("/").last }
+    assert_equal [{ "conversationId" => "first", "title" => "Synthetic first", "status" => 500,
+      "reason" => "Request timeout" }], result["state"]["fetchFailures"]
+    assert_equal 1, result["state"]["downloadsTriggeredThisRun"]
+    assert_equal 0, result["state"]["extractionFailures"]
+    assert_includes result["delays"], 60_000
+    assert_equal 1, result["downloads"].length
+    result["downloads"].each { |download| watch(download["text"]) }
+    assert_equal previous, @archive.current!("first")
+    previous_files.each { |name, hash| assert_equal hash, files[name], name }
+    remaining, = reconcile(listing)
+    assert_equal ["first"], remaining["pending"].map { |entry| entry["id"] }
+    resumed = browser(remaining, [raw("first", update: update)])
+    assert_nil resumed["error"]
+    assert_empty resumed["state"]["fetchFailures"]
+    resumed["downloads"].each { |download| watch(download["text"]) }
+    assert_empty reconcile(listing).first["pending"]
+  end
+
+  # Only the observed structured HTTP 500 timeout is deferrable. Authentication,
+  # other failures and malformed bodies still stop; a stop during spacing is honored.
+  def test_browser_request_timeout_keeps_other_http_failures_fatal
+    queue, = reconcile(inventory([row("first"), row("second")]))
+    cases = [
+      [401, { "detail" => "Request timeout" }],
+      [403, { "detail" => "Request timeout" }],
+      [500, { "detail" => "Internal server error" }],
+      [500, "not JSON"],
+      [500, nil],
+      [503, { "detail" => "Request timeout" }]
+    ]
+    cases.each do |status, body|
+      text = body.is_a?(String) ? body : JSON.generate(body)
+      result = browser(queue, [{ "status" => status, "bodyText" => text }])
+      assert_match(/HTTP #{status}/, result["error"])
+      assert_empty result["downloads"]
+      assert_empty result["state"]["fetchFailures"]
+      assert_equal 2, result["requests"].length
+      refute result["running"]
+    end
+    timeout = { "status" => 500, "raw" => { "detail" => "Request timeout" } }
+    stopped = browser(queue, [timeout], { "stopOnWait" => 60_000 })
+    assert_nil stopped["error"]
+    assert_empty stopped["downloads"]
+    assert_equal 2, stopped["requests"].length
+    assert_equal 1, stopped["state"]["fetchFailures"].length
+    refute stopped["running"]
+  end
+
   # Exercise existing rate controls and sequential stop/resume without real waits.
   def test_browser_rate_limit_stop_and_resume
     queue, = reconcile(inventory([row("first"), row("second")]))

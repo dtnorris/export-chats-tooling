@@ -513,6 +513,16 @@ delete window.__chatProjectBatchLimit;
 
 The runner processes one conversation at a time, defaults to roughly one request per minute, honors `Retry-After`, and uses increasing cooldowns after HTTP 429 responses. It does not use concurrency or alternate sessions.
 
+An HTTP 500 response with JSON `{"detail":"Request timeout"}` leaves that
+conversation pending and continues after the normal request spacing, without
+retrying it in the same run. Inspect `window.__chatProjectBatchState.fetchFailures`
+for affected IDs and titles. This does not mark those conversations captured or
+replace their previous snapshots. Other HTTP failures still stop the batch.
+Reconcile after the watcher drains, restart the watcher with the new queue, and
+paste the regenerated console program to retry only remaining work; replaying the
+old console program repeats its original queue. Persistent provider timeouts need
+later recovery even when the rest of the batch finishes.
+
 To request a clean stop between conversations:
 
 ```javascript

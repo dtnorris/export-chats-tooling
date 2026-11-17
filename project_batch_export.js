@@ -69,6 +69,17 @@
     return await response.text().catch(() => "");
   }
 
+  /** Recognize the provider's HTTP 500 Request timeout JSON response. Accepts
+   * status/body values and returns false for other or malformed errors; no throws. */
+  function isRequestTimeout(status, body) {
+    if (status !== 500) return false;
+    try {
+      return JSON.parse(body)?.detail === "Request timeout";
+    } catch {
+      return false;
+    }
+  }
+
   let sessionContext = null;
 
   /** Read the browser session and bind its account to this queue. Returns the
@@ -320,6 +331,7 @@
     runLimit,
     downloadsTriggeredThisRun: 0,
     extractionFailures: 0,
+    fetchFailures: [],
     current: null
   };
 
@@ -365,6 +377,14 @@
 
       if (!response.ok) {
         const body = await responseText(response);
+        if (isRequestTimeout(response.status, body)) {
+          const failure = { conversationId: entry.id, title: entry.title || "(untitled)",
+            status: response.status, reason: "Request timeout" };
+          window.__chatProjectBatchState.fetchFailures.push(failure);
+          console.warn(logPrefix, `Request timeout for ${entry.id}; leaving it pending and continuing without retrying.`, failure);
+          if (index < runLimit - 1 && !window.__chatProjectBatchStop) await sleep(baseDelay());
+          continue;
+        }
         fail(`Conversation fetch failed with HTTP ${response.status}; stopping rather than broad-retrying.`, {
           conversationId: entry.id,
           status: response.status,

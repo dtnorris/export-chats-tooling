@@ -48,7 +48,8 @@ async function batchRun(queue, conversations, options = {}) {
       if (response === undefined) throw new Error("Unexpected conversation request");
       const status = response.status || 200;
       return { ok: status === 200, status, statusText: "Synthetic", headers: { get: () => response.retryAfter || null },
-        text: async () => typeof response === "string" ? response : JSON.stringify(response.raw || response) };
+        text: async () => typeof response === "string" ? response :
+          (response.bodyText ?? JSON.stringify(response.raw || response)) };
     }
   };
   let error;
