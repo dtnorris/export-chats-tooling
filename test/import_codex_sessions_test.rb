@@ -816,14 +816,51 @@ class ImportCodexSessionsTest < Minitest::Test
     assert_operator md.index("record 5 (timestamp absent)"), :<, md.index("### Tool call")
   end
 
+  # Accepts a synthetic command diagnostic above the former bound, preserving
+  # raw bytes and rendered command text; failed import assertions fail the test.
+  def test_command_diagnostic_above_old_record_bound_is_accepted
+    records = fixture
+    command = "x" * (16 * 1024 * 1024)
+    diagnostic = row("event_msg", { "type" => "item_completed", "item" => {
+      "type" => "CommandExecution", "command" => [command],
+      "status" => "completed", "exit_code" => 0, "cwd" => "/tmp/synthetic" } })
+    assert_operator JSON.generate(diagnostic).bytesize, :>, 16 * 1024 * 1024
+    records.insert(3, diagnostic)
+    path = write_rollout(records)
+    code, _, errors = run_import
+    assert_equal 0, code, errors
+    assert_equal Digest::SHA256.file(path).hexdigest, Digest::SHA256.file(raw_path).hexdigest
+    assert_includes File.binread(markdown_paths.fetch(0)), command
+    assert_includes run_import[1], "unchanged=1"
+  end
+
+  # Rejects a record one byte over the finite bound before JSON parsing or any
+  # archive write, in both dry-run and import modes; assertions enforce failure.
   def test_oversized_record_fails_before_json_parse_or_archive_write
     path = write_rollout(fixture)
     File.open(path, "ab") { |file| file.write(" " * (CodexSessionImporter::MAX_LINE_BYTES + 1)) }
+    [true, false].each do |dry_run|
+      code, _, errors = run_import(dry_run: dry_run)
+      assert_equal 1, code
+      assert_includes errors, "exceeds #{CodexSessionImporter::MAX_LINE_BYTES} bytes"
+      refute_includes errors, "invalid JSON"
+      assert_empty markdown_paths
+      refute File.exist?(raw_path)
+    end
+  end
+
+  # Malformed JSON below the raised bound must still fail without archiving.
+  # The synthetic oversized-for-the-old-bound input contains no private data.
+  def test_malformed_record_above_old_bound_remains_rejected
+    path = write_rollout(fixture)
+    File.open(path, "ab") { |file| file.write(" " * (16 * 1024 * 1024) + "{invalid\n") }
     code, _, errors = run_import
     assert_equal 1, code
-    assert_includes errors, "exceeds"
+    assert_includes errors, "invalid JSON at record"
     assert_empty markdown_paths
+    refute File.exist?(raw_path)
   end
+
   def test_settled_only_skips_today_and_recently_modified_old_sessions
     file = write_rollout(fixture)
     prior_day = Time.local(2026, 10, 10, 19, 0)

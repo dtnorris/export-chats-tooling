@@ -19,7 +19,8 @@ class CodexSessionImporter
   DEFAULT_SOURCE = File.expand_path("~/.codex/sessions")
   DEFAULT_DATA_REPO = File.expand_path("../export-chats-data", __dir__)
   ID = /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
-  MAX_LINE_BYTES = 16 * 1024 * 1024
+  # Bound serialized records before parsing; command diagnostics can exceed 16 MiB.
+  MAX_LINE_BYTES = 32 * 1024 * 1024
   SETTLE_SECONDS = 2 * 60 * 60
 
   def initialize(source:, data_repo:, dry_run: false, verbose: false, settled_only: false, now: Time.now, output: $stdout, errors: $stderr)
