@@ -218,6 +218,9 @@ an identical raw file is accepted and the missing Markdown is created.
 Verify an import by checking the printed counts and paths, comparing
 `shasum -a 256` on an original JSONL and its `raw/codex/` copy, then rerunning
 and confirming `unchanged` equals `discovered` with zero conflicts/failures.
+Each JSONL record is limited to 32 MiB (including its newline), checked before
+JSON parsing or archival. Large command diagnostics can exceed 16 MiB; parsing
+and Markdown rendering may use several times the serialized record size.
 The parser rejects unknown response or execution item structures until their
 meaning is reviewed. It does not inline internal reasoning, developer messages,
 binary assets, full duplicate event representations, or token accounting in
